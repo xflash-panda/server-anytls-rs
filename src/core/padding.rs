@@ -21,7 +21,7 @@ pub struct PaddingRange {
     pub max: i32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PaddingFactory {
     pub stop: u32,
     pub ranges: HashMap<u32, Vec<PaddingRange>>,
