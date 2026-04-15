@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 use crate::core::hooks::{Authenticator, NoopStatsCollector, OutboundRouter, StatsCollector};
 use crate::core::padding::{DEFAULT_SCHEME, PaddingFactory};
@@ -33,9 +35,9 @@ impl Default for ServerConfig {
 // Server
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 pub struct Server {
     pub(crate) authenticator: Arc<dyn Authenticator>,
+    #[allow(dead_code)]
     pub(crate) stats: Arc<dyn StatsCollector>,
     pub(crate) router: Arc<dyn OutboundRouter>,
     pub(crate) tls_config: Option<Arc<rustls::ServerConfig>>,
@@ -53,6 +55,36 @@ impl Server {
         SessionConfig {
             max_streams: self.config.max_streams_per_session,
         }
+    }
+
+    pub async fn run(
+        self: &Arc<Self>,
+        listener: TcpListener,
+        shutdown: CancellationToken,
+    ) -> crate::error::Result<()> {
+        tracing::info!("anytls server started");
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    tracing::info!("shutdown signal received");
+                    break;
+                }
+                result = listener.accept() => {
+                    let (tcp_stream, peer_addr) = result?;
+                    let permit = self.semaphore.clone().acquire_owned().await;
+                    let Ok(permit) = permit else { continue; };
+                    let server = self.clone();
+                    tokio::spawn(async move {
+                        tracing::debug!("new connection from {}", peer_addr);
+                        if let Err(e) = crate::handler::handle_connection(server, tcp_stream).await {
+                            tracing::debug!("connection from {} ended: {}", peer_addr, e);
+                        }
+                        drop(permit);
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 }
 
