@@ -143,14 +143,16 @@ Runs as the main task for each connection. Reads frames sequentially:
 
 Each Stream implements `AsyncRead + AsyncWrite`:
 
-- **Read side**: `tokio::sync::mpsc` channel receives data from recv_loop
+- **Read side**: Bounded `tokio::sync::mpsc` channel (capacity 32) receives data from recv_loop
 - **Write side**: Acquires Session write lock, sends PSH frame on the shared connection
 - Supports `HandshakeSuccess` / `HandshakeFailure` (sends SYNACK, v2 only)
 - Deadline support via tokio timeouts
 
+**Difference from Go**: Go uses a synchronous unbuffered pipe — recv_loop blocks until the stream consumer reads. Rust uses a bounded mpsc channel, which decouples recv_loop from individual stream consumers. This avoids the Go deadlock risk where one slow stream blocks all streams on the session, at the cost of buffering up to `capacity` messages per stream in memory. Channel backpressure kicks in when the buffer is full.
+
 ### Write Path
 
-Session holds an `AsyncMutex` for the underlying TLS connection. All streams share this write lock. Frame payload capped at 65529 bytes (65536 - 7 header).
+Session holds an `AsyncMutex` for the underlying TLS connection. All streams share this write lock. Frame payload capped at 65535 bytes (u16 max).
 
 Server does NOT apply padding to outgoing writes (padding is client-side only). Server only pushes padding configuration to clients.
 
@@ -163,8 +165,14 @@ stop=8
 0=30-30
 1=100-400
 2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000
-3-7=500-1000
+3=9-9,500-1000
+4=500-1000
+5=500-1000
+6=500-1000
+7=500-1000
 ```
+
+Note: each packet number is an individual key. Range keys like `3-7=` are NOT supported — each must be listed separately.
 
 `PaddingFactory` stores parsed ranges. `generate_record_payload_sizes(pkt)` returns sizes list for given packet number. `c` = CheckMark (-1) = stop padding if user data exhausted.
 
