@@ -1,7 +1,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{info, warn};
 
@@ -28,7 +28,7 @@ pub(crate) fn parse_socks_address(data: &[u8]) -> Result<(Address, usize)> {
             Ok((Address::IPv4(ip, port), 7))
         }
         0x03 => {
-            // Domain: type(1) + len(1) + N + port(2); consumed = 1 + N + 2 (excluding type byte)
+            // Domain: type(1) + len(1) + N + port(2); consumed = total
             if data.len() < 2 {
                 return Err(Error::InvalidFrame("truncated domain length".into()));
             }
@@ -41,8 +41,8 @@ pub(crate) fn parse_socks_address(data: &[u8]) -> Result<(Address, usize)> {
                 .map_err(|_| Error::InvalidFrame("domain is not valid UTF-8".into()))?
                 .to_string();
             let port = u16::from_be_bytes([data[2 + name_len], data[2 + name_len + 1]]);
-            // consumed = len_byte(1) + name(N) + port(2) — type byte not counted
-            Ok((Address::Domain(domain, port), 1 + name_len + 2))
+            // consumed = type(1) + len_byte(1) + name(N) + port(2)
+            Ok((Address::Domain(domain, port), total))
         }
         0x04 => {
             // IPv6: 1 + 16 + 2 = 19 bytes
@@ -81,7 +81,7 @@ pub(crate) async fn handle_stream<T: AsyncRead + AsyncWrite + Unpin + Send + 'st
         return Err(Error::StreamClosed);
     }
 
-    let (target, _consumed) = parse_socks_address(&buf[..n])?;
+    let (target, consumed) = parse_socks_address(&buf[..n])?;
 
     if is_udp_over_tcp(&target) {
         info!(
@@ -91,9 +91,10 @@ pub(crate) async fn handle_stream<T: AsyncRead + AsyncWrite + Unpin + Send + 'st
         return Ok(());
     }
 
+    let trailing = buf[consumed..n].to_vec();
     let outbound = server.router.route(&target).await;
     match outbound {
-        OutboundType::Direct => proxy_tcp(server, session, stream, &target).await,
+        OutboundType::Direct => proxy_tcp(server, session, stream, &target, trailing).await,
         OutboundType::Reject => {
             warn!("rejecting connection to {}", target);
             let stream_id = stream.id();
@@ -104,12 +105,15 @@ pub(crate) async fn handle_stream<T: AsyncRead + AsyncWrite + Unpin + Send + 'st
 }
 
 /// Connect to `target` and bidirectionally relay data between `stream` and the
-/// remote TCP connection.
+/// remote TCP connection.  `trailing` holds any bytes that were read from the
+/// stream beyond the SOCKS address (e.g. the start of the HTTP request or TLS
+/// ClientHello) and must be forwarded to the remote before bidirectional copy.
 async fn proxy_tcp<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     server: Arc<Server>,
     session: Arc<Session<T>>,
     mut stream: Stream,
     target: &Address,
+    trailing: Vec<u8>,
 ) -> Result<()> {
     let stream_id = stream.id();
     let addr_str = target.to_socket_string();
@@ -137,6 +141,11 @@ async fn proxy_tcp<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     };
 
     session.handshake_success(stream_id).await?;
+
+    // Forward any application data that was read alongside the SOCKS address.
+    if !trailing.is_empty() {
+        remote.write_all(&trailing).await?;
+    }
 
     let _ = tokio::io::copy_bidirectional(&mut stream, &mut remote).await;
 
@@ -196,7 +205,7 @@ mod tests {
         } else {
             panic!("expected Domain address");
         }
-        assert_eq!(consumed, 14);
+        assert_eq!(consumed, 15);
     }
 
     #[test]
