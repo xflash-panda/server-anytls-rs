@@ -21,6 +21,7 @@ subtle = "2"
 [dev-dependencies]
 tokio-test = "0.4"
 criterion = { version = "0.5", features = ["async_tokio"] }
+rcgen = "0.14.7"
 
 [[bench]]
 name = "frame_bench"
