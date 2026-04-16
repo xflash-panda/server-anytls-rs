@@ -6,7 +6,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use tokio_util::sync::PollSender;
 
-const CHANNEL_CAPACITY: usize = 32;
+const CHANNEL_CAPACITY: usize = 128;
 
 pub struct WriteCommand {
     pub stream_id: u32,

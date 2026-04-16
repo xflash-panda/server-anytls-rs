@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -14,9 +14,12 @@ use crate::error::Result;
 
 /// Write a single WriteCommand as one or more PSH frames (chunking at u16::MAX).
 /// Does NOT flush — caller is responsible for flushing after batching.
+/// Header and payload are coalesced into a single write to avoid generating
+/// separate TLS records (each record adds ~29 bytes overhead + encryption).
 async fn write_psh_frames<W: AsyncWriteExt + Unpin>(
     w: &mut W,
     cmd: &WriteCommand,
+    combined_buf: &mut Vec<u8>,
 ) -> std::io::Result<()> {
     let data = &cmd.data;
     let total = data.len();
@@ -29,12 +32,13 @@ async fn write_psh_frames<W: AsyncWriteExt + Unpin>(
             stream_id: cmd.stream_id,
             length: chunk.len() as u16,
         };
+        // Coalesce header + payload into a single write_all call.
+        combined_buf.clear();
         let mut hdr_buf = [0u8; HEADER_SIZE];
         header.encode(&mut hdr_buf);
-        w.write_all(&hdr_buf).await?;
-        if !chunk.is_empty() {
-            w.write_all(chunk).await?;
-        }
+        combined_buf.extend_from_slice(&hdr_buf);
+        combined_buf.extend_from_slice(chunk);
+        w.write_all(combined_buf).await?;
         offset = chunk_end;
         if offset >= total {
             break;
@@ -78,21 +82,23 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
     }
 
     pub async fn recv_loop(self: Arc<Self>, new_stream_tx: mpsc::Sender<Stream>) -> Result<()> {
-        let mut streams: HashMap<u32, mpsc::Sender<Bytes>> = HashMap::new();
+        let mut streams: FxHashMap<u32, mpsc::Sender<Bytes>> = FxHashMap::default();
         let mut settings_received = false;
 
         // Create the write command channel and spawn writer task
         let (write_cmd_tx, mut write_cmd_rx) = mpsc::channel::<WriteCommand>(256);
         let writer = self.write_half.clone();
         tokio::spawn(async move {
+            // Reusable buffer for coalescing header+payload into single writes.
+            let mut combined_buf = Vec::with_capacity(HEADER_SIZE + u16::MAX as usize);
             while let Some(cmd) = write_cmd_rx.recv().await {
                 let mut w = writer.lock().await;
-                if write_psh_frames(&mut *w, &cmd).await.is_err() {
+                if write_psh_frames(&mut *w, &cmd, &mut combined_buf).await.is_err() {
                     return;
                 }
                 // Drain all pending commands without blocking (batch writes)
                 while let Ok(cmd) = write_cmd_rx.try_recv() {
-                    if write_psh_frames(&mut *w, &cmd).await.is_err() {
+                    if write_psh_frames(&mut *w, &cmd, &mut combined_buf).await.is_err() {
                         return;
                     }
                 }
@@ -240,13 +246,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             stream_id,
             length: data.len() as u16,
         };
+        // Coalesce header + payload into a single write to avoid separate TLS records.
+        let mut buf = Vec::with_capacity(HEADER_SIZE + data.len());
         let mut hdr_buf = [0u8; HEADER_SIZE];
         header.encode(&mut hdr_buf);
+        buf.extend_from_slice(&hdr_buf);
+        buf.extend_from_slice(data);
         let mut w = self.write_half.lock().await;
-        w.write_all(&hdr_buf).await?;
-        if !data.is_empty() {
-            w.write_all(data).await?;
-        }
+        w.write_all(&buf).await?;
         // Flush immediately so control frames are not delayed in the buffer.
         // Without this, frames can sit in BufWriter/TLS buffers until the next
         // data write triggers a flush, adding latency to handshakes and heartbeats.
@@ -261,7 +268,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
         send_padding: bool,
         send_server_settings: bool,
     ) -> Result<()> {
-        let mut w = self.write_half.lock().await;
+        // Build all response frames into a single buffer to minimize TLS records.
+        let mut buf = Vec::new();
         if send_padding {
             let data = self.padding.raw_scheme().as_bytes();
             let header = FrameHeader {
@@ -271,8 +279,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             };
             let mut hdr_buf = [0u8; HEADER_SIZE];
             header.encode(&mut hdr_buf);
-            w.write_all(&hdr_buf).await?;
-            w.write_all(data).await?;
+            buf.extend_from_slice(&hdr_buf);
+            buf.extend_from_slice(data);
         }
         if send_server_settings {
             let header = FrameHeader {
@@ -282,9 +290,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             };
             let mut hdr_buf = [0u8; HEADER_SIZE];
             header.encode(&mut hdr_buf);
-            w.write_all(&hdr_buf).await?;
-            w.write_all(b"v=2").await?;
+            buf.extend_from_slice(&hdr_buf);
+            buf.extend_from_slice(b"v=2");
         }
+        let mut w = self.write_half.lock().await;
+        w.write_all(&buf).await?;
         w.flush().await?;
         Ok(())
     }
