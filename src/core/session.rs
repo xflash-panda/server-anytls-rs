@@ -151,17 +151,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                     self.peer_version.store(peer_version, Ordering::Relaxed);
                     settings_received = true;
 
-                    if peer_padding_md5 != self.padding.md5_hex() {
-                        self.write_frame(
-                            Command::UpdatePaddingScheme,
-                            0,
-                            self.padding.raw_scheme().as_bytes(),
-                        )
-                        .await?;
-                    }
-
-                    if peer_version >= 2 {
-                        self.write_frame(Command::ServerSettings, 0, b"v=2").await?;
+                    // Batch settings response frames under a single lock + flush.
+                    let need_padding = peer_padding_md5 != self.padding.md5_hex();
+                    let need_server_settings = peer_version >= 2;
+                    if need_padding || need_server_settings {
+                        self.write_settings_response(need_padding, need_server_settings)
+                            .await?;
                     }
                 }
                 Command::Syn => {
@@ -214,14 +209,18 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                     warn!("received alert: {}", msg);
                     break;
                 }
-                // Waste, HeartRequest, HeartResponse, and unknown commands: skip payload
-                _ => {
+                Command::HeartRequest => {
                     if len > 0 {
                         payload_buf.resize(len, 0);
                         reader.read_exact(&mut payload_buf[..len]).await?;
                     }
-                    if header.command == Command::HeartRequest {
-                        self.write_frame(Command::HeartResponse, 0, &[]).await?;
+                    self.write_frame(Command::HeartResponse, 0, &[]).await?;
+                }
+                // Waste, HeartResponse, and unknown commands: skip payload
+                _ => {
+                    if len > 0 {
+                        payload_buf.resize(len, 0);
+                        reader.read_exact(&mut payload_buf[..len]).await?;
                     }
                 }
             }
@@ -248,6 +247,45 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
         if !data.is_empty() {
             w.write_all(data).await?;
         }
+        // Flush immediately so control frames are not delayed in the buffer.
+        // Without this, frames can sit in BufWriter/TLS buffers until the next
+        // data write triggers a flush, adding latency to handshakes and heartbeats.
+        w.flush().await?;
+        Ok(())
+    }
+
+    /// Batch-write settings response frames (UpdatePaddingScheme and/or
+    /// ServerSettings) under a single lock acquisition and flush.
+    async fn write_settings_response(
+        &self,
+        send_padding: bool,
+        send_server_settings: bool,
+    ) -> Result<()> {
+        let mut w = self.write_half.lock().await;
+        if send_padding {
+            let data = self.padding.raw_scheme().as_bytes();
+            let header = FrameHeader {
+                command: Command::UpdatePaddingScheme,
+                stream_id: 0,
+                length: data.len() as u16,
+            };
+            let mut hdr_buf = [0u8; HEADER_SIZE];
+            header.encode(&mut hdr_buf);
+            w.write_all(&hdr_buf).await?;
+            w.write_all(data).await?;
+        }
+        if send_server_settings {
+            let header = FrameHeader {
+                command: Command::ServerSettings,
+                stream_id: 0,
+                length: 3,
+            };
+            let mut hdr_buf = [0u8; HEADER_SIZE];
+            header.encode(&mut hdr_buf);
+            w.write_all(&hdr_buf).await?;
+            w.write_all(b"v=2").await?;
+        }
+        w.flush().await?;
         Ok(())
     }
 
@@ -389,6 +427,66 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&buf[..n], b"hello from client");
+        drop(client_io);
+        let _ = handle.await;
+    }
+
+    /// Verify that write_frame flushes immediately so control frames are not
+    /// delayed when the transport is buffered (e.g. BufWriter / TLS).
+    #[tokio::test]
+    async fn test_control_frame_flushed_immediately() {
+        let (mut client_io, server_io) = duplex(65536);
+        let buf_server_io = tokio::io::BufWriter::with_capacity(8192, server_io);
+        let padding = test_padding();
+        let session = Arc::new(Session::new_server(
+            buf_server_io,
+            padding,
+            SessionConfig::default(),
+        ));
+        let (new_stream_tx, _) = tokio::sync::mpsc::channel(8);
+        let settings_data = format!("v=2\npadding-md5={}", session.padding_md5());
+        write_frame(
+            &mut client_io,
+            Command::Settings,
+            0,
+            settings_data.as_bytes(),
+        )
+        .await;
+        let sess = session.clone();
+        let handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx).await });
+
+        // Send a HeartRequest — server should respond with HeartResponse
+        write_frame(&mut client_io, Command::HeartRequest, 0, &[]).await;
+
+        // Try to read the response within a short timeout.
+        // If write_frame doesn't flush, the HeartResponse will be stuck in BufWriter.
+        let mut hdr_buf = [0u8; HEADER_SIZE];
+        let mut found_heart = false;
+        for _ in 0..5 {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                client_io.read_exact(&mut hdr_buf),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    let hdr = FrameHeader::decode(&hdr_buf);
+                    if hdr.length > 0 {
+                        let mut skip = vec![0u8; hdr.length as usize];
+                        client_io.read_exact(&mut skip).await.unwrap();
+                    }
+                    if hdr.command == Command::HeartResponse {
+                        found_heart = true;
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(
+            found_heart,
+            "HeartResponse not received within timeout — write_frame likely not flushing"
+        );
         drop(client_io);
         let _ = handle.await;
     }

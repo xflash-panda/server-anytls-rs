@@ -49,14 +49,8 @@ pub struct FrameHeader {
 impl FrameHeader {
     pub fn encode(&self, buf: &mut [u8; HEADER_SIZE]) {
         buf[0] = self.command as u8;
-        let id_bytes = self.stream_id.to_be_bytes();
-        buf[1] = id_bytes[0];
-        buf[2] = id_bytes[1];
-        buf[3] = id_bytes[2];
-        buf[4] = id_bytes[3];
-        let len_bytes = self.length.to_be_bytes();
-        buf[5] = len_bytes[0];
-        buf[6] = len_bytes[1];
+        buf[1..5].copy_from_slice(&self.stream_id.to_be_bytes());
+        buf[5..7].copy_from_slice(&self.length.to_be_bytes());
     }
 
     pub fn decode(buf: &[u8; HEADER_SIZE]) -> Self {

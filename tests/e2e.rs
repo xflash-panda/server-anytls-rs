@@ -30,9 +30,7 @@ fn make_tls_configs() -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) 
     let cert = generate_simple_self_signed(subject_alt_names).unwrap();
 
     let cert_der = CertificateDer::from(cert.cert.der().to_vec());
-    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-        cert.signing_key.serialize_der(),
-    ));
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
 
     // Server config
     let server_config = rustls::ServerConfig::builder()
@@ -117,9 +115,7 @@ fn socks5_ipv4_addr(ip: [u8; 4], port: u16) -> Vec<u8> {
     data
 }
 
-async fn read_frame(
-    reader: &mut (impl AsyncReadExt + Unpin),
-) -> Option<(FrameHeader, Vec<u8>)> {
+async fn read_frame(reader: &mut (impl AsyncReadExt + Unpin)) -> Option<(FrameHeader, Vec<u8>)> {
     let mut hdr_buf = [0u8; HEADER_SIZE];
     match tokio::time::timeout(Duration::from_secs(3), reader.read_exact(&mut hdr_buf)).await {
         Ok(Ok(_)) => {}
@@ -287,7 +283,10 @@ async fn test_auth_failure() {
             // Expected: connection closed or error
         }
         Ok(Ok(n)) => {
-            panic!("expected connection close after auth failure, got {} bytes", n);
+            panic!(
+                "expected connection close after auth failure, got {} bytes",
+                n
+            );
         }
     }
 
@@ -330,9 +329,13 @@ async fn test_heartbeat() {
 
     // Settings
     let settings_data = format!("v=2\npadding-md5={}", padding_md5);
-    tls.write_all(&encode_frame(Command::Settings, 0, settings_data.as_bytes()))
-        .await
-        .unwrap();
+    tls.write_all(&encode_frame(
+        Command::Settings,
+        0,
+        settings_data.as_bytes(),
+    ))
+    .await
+    .unwrap();
 
     // Drain ServerSettings
     for _ in 0..3 {

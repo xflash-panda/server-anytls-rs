@@ -3,7 +3,7 @@
 //! Simulates the relay path: data flows through Stream (which uses channels)
 //! and measures how copy_bidirectional buffer size affects throughput.
 
-use criterion::{Criterion, criterion_group, criterion_main, Throughput};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use server_anytls_rs::core::frame::{Command, FrameHeader, HEADER_SIZE};
 use server_anytls_rs::core::padding::{DEFAULT_SCHEME, PaddingFactory};
 use server_anytls_rs::core::session::{Session, SessionConfig};

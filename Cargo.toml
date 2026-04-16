@@ -44,6 +44,14 @@ harness = false
 name = "relay_bench"
 harness = false
 
+[[bench]]
+name = "control_frame_bench"
+harness = false
+
+[[bench]]
+name = "stream_write_bench"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "fat"

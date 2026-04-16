@@ -147,8 +147,7 @@ async fn proxy_tcp<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         remote.write_all(&trailing).await?;
     }
 
-    let _ =
-        tokio::io::copy_bidirectional_with_sizes(&mut stream, &mut remote, 65536, 65536).await;
+    let _ = tokio::io::copy_bidirectional_with_sizes(&mut stream, &mut remote, 65536, 65536).await;
 
     session.send_fin(stream_id).await?;
 

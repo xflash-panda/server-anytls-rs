@@ -1,6 +1,6 @@
 //! RED/GREEN benchmark: session write/read throughput.
 
-use criterion::{Criterion, criterion_group, criterion_main, Throughput};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use server_anytls_rs::core::frame::{Command, FrameHeader, HEADER_SIZE};
 use server_anytls_rs::core::padding::{DEFAULT_SCHEME, PaddingFactory};
 use server_anytls_rs::core::session::{Session, SessionConfig};
@@ -55,8 +55,7 @@ fn bench_write_throughput(c: &mut Criterion) {
 
                 let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
                 let sess = session.clone();
-                let recv_handle =
-                    tokio::spawn(async move { sess.recv_loop(new_stream_tx).await });
+                let recv_handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx).await });
 
                 let mut stream = new_stream_rx.recv().await.unwrap();
 
@@ -120,8 +119,7 @@ fn bench_read_throughput(c: &mut Criterion) {
 
                 let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
                 let sess = session.clone();
-                let recv_handle =
-                    tokio::spawn(async move { sess.recv_loop(new_stream_tx).await });
+                let recv_handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx).await });
 
                 let mut stream = new_stream_rx.recv().await.unwrap();
 
