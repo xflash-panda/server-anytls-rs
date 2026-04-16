@@ -147,7 +147,8 @@ async fn proxy_tcp<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         remote.write_all(&trailing).await?;
     }
 
-    let _ = tokio::io::copy_bidirectional(&mut stream, &mut remote).await;
+    let _ =
+        tokio::io::copy_bidirectional_with_sizes(&mut stream, &mut remote, 65536, 65536).await;
 
     session.send_fin(stream_id).await?;
 
@@ -156,17 +157,19 @@ async fn proxy_tcp<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
 /// Resolve and connect to the target address.
 async fn connect_target(target: &Address) -> std::io::Result<TcpStream> {
-    match target {
+    let stream = match target {
         Address::IPv4(ip, port) => {
             let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(*ip), *port));
-            TcpStream::connect(addr).await
+            TcpStream::connect(addr).await?
         }
         Address::IPv6(ip, port) => {
             let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(*ip), *port, 0, 0));
-            TcpStream::connect(addr).await
+            TcpStream::connect(addr).await?
         }
-        Address::Domain(host, port) => TcpStream::connect((host.as_str(), *port)).await,
-    }
+        Address::Domain(host, port) => TcpStream::connect((host.as_str(), *port)).await?,
+    };
+    let _ = stream.set_nodelay(true);
+    Ok(stream)
 }
 
 #[cfg(test)]

@@ -71,6 +71,7 @@ impl Server {
                 }
                 result = listener.accept() => {
                     let (tcp_stream, peer_addr) = result?;
+                    let _ = tcp_stream.set_nodelay(true);
                     let permit = self.semaphore.clone().acquire_owned().await;
                     let Ok(permit) = permit else { continue; };
                     let server = self.clone();

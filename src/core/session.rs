@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, warn};
@@ -11,6 +11,37 @@ use crate::core::frame::{Command, FrameHeader, HEADER_SIZE};
 use crate::core::padding::PaddingFactory;
 use crate::core::stream::{Stream, WriteCommand};
 use crate::error::Result;
+
+/// Write a single WriteCommand as one or more PSH frames (chunking at u16::MAX).
+/// Does NOT flush — caller is responsible for flushing after batching.
+async fn write_psh_frames<W: AsyncWriteExt + Unpin>(
+    w: &mut W,
+    cmd: &WriteCommand,
+) -> std::io::Result<()> {
+    let data = &cmd.data;
+    let total = data.len();
+    let mut offset = 0;
+    loop {
+        let chunk_end = (offset + u16::MAX as usize).min(total);
+        let chunk = &data[offset..chunk_end];
+        let header = FrameHeader {
+            command: Command::Psh,
+            stream_id: cmd.stream_id,
+            length: chunk.len() as u16,
+        };
+        let mut hdr_buf = [0u8; HEADER_SIZE];
+        header.encode(&mut hdr_buf);
+        w.write_all(&hdr_buf).await?;
+        if !chunk.is_empty() {
+            w.write_all(chunk).await?;
+        }
+        offset = chunk_end;
+        if offset >= total {
+            break;
+        }
+    }
+    Ok(())
+}
 
 pub struct SessionConfig {
     pub max_streams: usize,
@@ -55,43 +86,26 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
         let writer = self.write_half.clone();
         tokio::spawn(async move {
             while let Some(cmd) = write_cmd_rx.recv().await {
-                // Split data into u16::MAX-sized PSH frames to avoid truncation,
-                // matching the Go implementation's writeDataFrame chunking logic.
-                let mut offset = 0;
-                let data = &cmd.data;
-                let total = data.len();
-                // Always send at least one frame (even for empty payloads).
-                loop {
-                    let chunk_end = (offset + u16::MAX as usize).min(total);
-                    let chunk = &data[offset..chunk_end];
-                    let header = FrameHeader {
-                        command: Command::Psh,
-                        stream_id: cmd.stream_id,
-                        length: chunk.len() as u16,
-                    };
-                    let mut hdr_buf = [0u8; HEADER_SIZE];
-                    header.encode(&mut hdr_buf);
-                    let mut w = writer.lock().await;
-                    if w.write_all(&hdr_buf).await.is_err() {
+                let mut w = writer.lock().await;
+                if write_psh_frames(&mut *w, &cmd).await.is_err() {
+                    return;
+                }
+                // Drain all pending commands without blocking (batch writes)
+                while let Ok(cmd) = write_cmd_rx.try_recv() {
+                    if write_psh_frames(&mut *w, &cmd).await.is_err() {
                         return;
                     }
-                    if !chunk.is_empty() && w.write_all(chunk).await.is_err() {
-                        return;
-                    }
-                    // Flush to avoid TLS buffering latency.
-                    if w.flush().await.is_err() {
-                        return;
-                    }
-                    drop(w);
-                    offset = chunk_end;
-                    if offset >= total {
-                        break;
-                    }
+                }
+                // Single flush for entire batch
+                if w.flush().await.is_err() {
+                    return;
                 }
             }
         });
 
         let mut reader = self.read_half.lock().await;
+        // Reusable buffer to avoid per-frame heap allocation
+        let mut payload_buf = BytesMut::with_capacity(u16::MAX as usize);
         loop {
             let mut hdr_buf = [0u8; HEADER_SIZE];
             match reader.read_exact(&mut hdr_buf).await {
@@ -104,13 +118,27 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             }
 
             let header = FrameHeader::decode(&hdr_buf);
+            let len = header.length as usize;
+
             match header.command {
-                Command::Settings => {
-                    let mut data = vec![0u8; header.length as usize];
-                    if header.length > 0 {
-                        reader.read_exact(&mut data).await?;
+                Command::Psh => {
+                    payload_buf.resize(len, 0);
+                    if len > 0 {
+                        reader.read_exact(&mut payload_buf[..len]).await?;
                     }
-                    let text = String::from_utf8_lossy(&data);
+                    if let Some(tx) = streams.get(&header.stream_id) {
+                        // split() → freeze() gives a zero-copy Bytes;
+                        // the underlying allocation is reused on next resize.
+                        let data = payload_buf.split().freeze();
+                        let _ = tx.send(data).await;
+                    }
+                }
+                Command::Settings => {
+                    payload_buf.resize(len, 0);
+                    if len > 0 {
+                        reader.read_exact(&mut payload_buf[..len]).await?;
+                    }
+                    let text = String::from_utf8_lossy(&payload_buf[..len]);
                     let mut peer_version: u8 = 0;
                     let mut peer_padding_md5 = String::new();
                     for line in text.lines() {
@@ -144,24 +172,24 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                             b"settings not received",
                         )
                         .await?;
-                        if header.length > 0 {
-                            let mut skip = vec![0u8; header.length as usize];
-                            reader.read_exact(&mut skip).await?;
+                        if len > 0 {
+                            payload_buf.resize(len, 0);
+                            reader.read_exact(&mut payload_buf[..len]).await?;
                         }
                         continue;
                     }
                     if streams.len() >= self.config.max_streams {
                         self.write_frame(Command::Alert, header.stream_id, b"max streams exceeded")
                             .await?;
-                        if header.length > 0 {
-                            let mut skip = vec![0u8; header.length as usize];
-                            reader.read_exact(&mut skip).await?;
+                        if len > 0 {
+                            payload_buf.resize(len, 0);
+                            reader.read_exact(&mut payload_buf[..len]).await?;
                         }
                         continue;
                     }
-                    if header.length > 0 {
-                        let mut skip = vec![0u8; header.length as usize];
-                        reader.read_exact(&mut skip).await?;
+                    if len > 0 {
+                        payload_buf.resize(len, 0);
+                        reader.read_exact(&mut payload_buf[..len]).await?;
                     }
                     let (data_tx, stream) = Stream::new(header.stream_id, write_cmd_tx.clone());
                     streams.insert(header.stream_id, data_tx);
@@ -170,48 +198,30 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                         break;
                     }
                 }
-                Command::Psh => {
-                    let mut data = vec![0u8; header.length as usize];
-                    if header.length > 0 {
-                        reader.read_exact(&mut data).await?;
-                    }
-                    if let Some(tx) = streams.get(&header.stream_id) {
-                        let _ = tx.send(Bytes::from(data)).await;
-                    }
-                }
                 Command::Fin => {
-                    if header.length > 0 {
-                        let mut skip = vec![0u8; header.length as usize];
-                        reader.read_exact(&mut skip).await?;
+                    if len > 0 {
+                        payload_buf.resize(len, 0);
+                        reader.read_exact(&mut payload_buf[..len]).await?;
                     }
                     streams.remove(&header.stream_id);
                 }
-                Command::Waste => {
-                    if header.length > 0 {
-                        let mut skip = vec![0u8; header.length as usize];
-                        reader.read_exact(&mut skip).await?;
-                    }
-                }
-                Command::HeartRequest => {
-                    if header.length > 0 {
-                        let mut skip = vec![0u8; header.length as usize];
-                        reader.read_exact(&mut skip).await?;
-                    }
-                    self.write_frame(Command::HeartResponse, 0, &[]).await?;
-                }
                 Command::Alert => {
-                    let mut data = vec![0u8; header.length as usize];
-                    if header.length > 0 {
-                        reader.read_exact(&mut data).await?;
+                    payload_buf.resize(len, 0);
+                    if len > 0 {
+                        reader.read_exact(&mut payload_buf[..len]).await?;
                     }
-                    let msg = String::from_utf8_lossy(&data);
+                    let msg = String::from_utf8_lossy(&payload_buf[..len]);
                     warn!("received alert: {}", msg);
                     break;
                 }
+                // Waste, HeartRequest, HeartResponse, and unknown commands: skip payload
                 _ => {
-                    if header.length > 0 {
-                        let mut skip = vec![0u8; header.length as usize];
-                        reader.read_exact(&mut skip).await?;
+                    if len > 0 {
+                        payload_buf.resize(len, 0);
+                        reader.read_exact(&mut payload_buf[..len]).await?;
+                    }
+                    if header.command == Command::HeartRequest {
+                        self.write_frame(Command::HeartResponse, 0, &[]).await?;
                     }
                 }
             }

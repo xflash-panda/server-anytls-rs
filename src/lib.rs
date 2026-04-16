@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 pub mod core;
 pub mod error;
 pub mod handler;
