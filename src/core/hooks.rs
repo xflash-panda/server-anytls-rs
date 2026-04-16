@@ -8,6 +8,7 @@ pub type UserId = i64;
 // Address
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone)]
 pub enum Address {
     IPv4([u8; 4], u16),
     IPv6([u8; 16], u16),

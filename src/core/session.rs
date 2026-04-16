@@ -78,6 +78,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                     if !chunk.is_empty() && w.write_all(chunk).await.is_err() {
                         return;
                     }
+                    // Flush to avoid TLS buffering latency.
+                    if w.flush().await.is_err() {
+                        return;
+                    }
                     drop(w);
                     offset = chunk_end;
                     if offset >= total {

@@ -23,8 +23,8 @@ pub struct PaddingRange {
 
 #[derive(Debug, Clone)]
 pub struct PaddingFactory {
-    pub stop: u32,
-    pub ranges: HashMap<u32, Vec<PaddingRange>>,
+    stop: u32,
+    ranges: HashMap<u32, Vec<PaddingRange>>,
     raw: String,
     md5: String,
 }

@@ -1,10 +1,8 @@
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio_rustls::TlsAcceptor;
 
 use crate::core::hooks::{Authenticator, UserId};
@@ -13,6 +11,9 @@ use crate::core::server::Server;
 use crate::core::session::Session;
 use crate::core::stream::Stream;
 use crate::error::{Error, Result};
+
+/// Maximum allowed padding length in auth (cap at 1KB to prevent DoS).
+const MAX_PADDING_LEN: u16 = 1024;
 
 pub(crate) async fn read_auth<R: AsyncRead + Unpin>(
     reader: &mut R,
@@ -23,12 +24,24 @@ pub(crate) async fn read_auth<R: AsyncRead + Unpin>(
 
     let user_id = authenticator.authenticate(&hash);
 
+    // If auth failed, return immediately — no need to read padding.
+    if user_id.is_none() {
+        return Ok(None);
+    }
+
     let mut padding_len_buf = [0u8; 2];
     reader.read_exact(&mut padding_len_buf).await?;
-    let padding_len = u16::from_be_bytes(padding_len_buf) as usize;
+    let padding_len = u16::from_be_bytes(padding_len_buf);
+
+    if padding_len > MAX_PADDING_LEN {
+        return Err(Error::InvalidFrame(format!(
+            "auth padding too large: {} > {}",
+            padding_len, MAX_PADDING_LEN
+        )));
+    }
 
     if padding_len > 0 {
-        let mut padding = vec![0u8; padding_len];
+        let mut padding = vec![0u8; padding_len as usize];
         reader.read_exact(&mut padding).await?;
     }
 
@@ -59,21 +72,32 @@ pub(crate) async fn handle_connection(server: Arc<Server>, tcp_stream: TcpStream
 
     let (new_stream_tx, mut new_stream_rx) = mpsc::channel::<Stream>(256);
 
+    // Bound concurrent stream handlers to the same limit as max_streams_per_session.
+    let stream_sem = Arc::new(Semaphore::new(server.config.max_streams_per_session));
+
     let session_clone = session.clone();
     let server_clone = server.clone();
     tokio::spawn(async move {
         while let Some(stream) = new_stream_rx.recv().await {
+            let permit = stream_sem.clone().acquire_owned().await;
+            let Ok(permit) = permit else { break };
             let srv = server_clone.clone();
             let sess = session_clone.clone();
             tokio::spawn(async move {
                 let _ = crate::outbound::handle_stream(srv, sess, stream).await;
+                drop(permit);
             });
         }
     });
 
-    session.recv_loop(new_stream_tx).await?;
-
-    Ok(())
+    let idle_timeout = server.config.idle_timeout;
+    tokio::select! {
+        result = session.recv_loop(new_stream_tx) => result,
+        _ = tokio::time::sleep(idle_timeout) => {
+            tracing::info!("session idle timeout");
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -109,15 +133,36 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_auth_wrong_password() {
-        let packet = make_auth_packet("wrongpassword", 5);
+        // Only send hash (32 bytes) — auth fails before reading padding.
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"wrongpassword");
+        let hash = hasher.finalize();
         let (mut writer, reader) = duplex(4096);
-        writer.write_all(&packet).await.unwrap();
+        writer.write_all(&hash).await.unwrap();
         drop(writer);
         let mut reader = tokio::io::BufReader::new(reader);
         let auth = SinglePasswordAuth::new("mypassword");
         let result = read_auth(&mut reader, &auth).await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_read_auth_padding_too_large() {
+        // Padding length exceeds MAX_PADDING_LEN — should return error.
+        let mut packet = Vec::new();
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"mypassword");
+        packet.extend_from_slice(&hasher.finalize());
+        // Set padding len to MAX_PADDING_LEN + 1
+        packet.extend_from_slice(&(MAX_PADDING_LEN + 1).to_be_bytes());
+        let (mut writer, reader) = duplex(4096);
+        writer.write_all(&packet).await.unwrap();
+        drop(writer);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let auth = SinglePasswordAuth::new("mypassword");
+        let result = read_auth(&mut reader, &auth).await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
