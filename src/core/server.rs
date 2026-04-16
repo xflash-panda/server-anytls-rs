@@ -191,8 +191,9 @@ impl ServerBuilder {
         let tls_config = self.tls_config.map(|mut tls| {
             // Enable session tickets for TLS resumption — avoids a full
             // handshake on reconnect, reducing latency by 1-RTT.
-            if let Ok(ticketer) = rustls::crypto::aws_lc_rs::Ticketer::new() {
-                tls.ticketer = ticketer;
+            match rustls::crypto::aws_lc_rs::Ticketer::new() {
+                Ok(ticketer) => tls.ticketer = ticketer,
+                Err(e) => tracing::warn!("failed to create TLS session ticketer: {e}"),
             }
             Arc::new(tls)
         });

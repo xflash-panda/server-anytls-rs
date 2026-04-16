@@ -54,11 +54,8 @@ async fn start_tls_server(server_config: Arc<rustls::ServerConfig>) -> (u16, Can
                     if let Ok((tcp, _)) = result {
                         let acc = acceptor.clone();
                         tokio::spawn(async move {
-                            if let Ok(mut tls) = acc.accept(tcp).await {
-                                use tokio::io::AsyncReadExt;
-                                let mut buf = [0u8; 1];
-                                let _ = tls.read(&mut buf).await;
-                            }
+                            // Accept TLS then drop — client doesn't send data in this bench
+                            let _ = acc.accept(tcp).await;
                         });
                     }
                 }
@@ -96,30 +93,9 @@ fn bench_tls_handshake(c: &mut Criterion) {
         cancel.cancel();
     }
 
-    // --- Full handshake (with tickets, but first connection = always full) ---
-    {
-        let (server_config, client_config) = make_tls_configs(true);
-        let (port, cancel) = rt.block_on(start_tls_server(server_config));
-        let connector = TlsConnector::from(client_config);
-
-        group.bench_function("full_with_tickets", |b| {
-            b.iter(|| {
-                rt.block_on(async {
-                    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-                    let tcp = TcpStream::connect(format!("127.0.0.1:{}", port))
-                        .await
-                        .unwrap();
-                    let _tls = connector.connect(server_name, tcp).await.unwrap();
-                })
-            });
-        });
-
-        cancel.cancel();
-    }
-
     // --- Resumed handshake (with tickets, warm session cache) ---
-    // Each iteration gets a fresh client config + one warm-up connection,
-    // but this time we only measure the SECOND connection (resumed).
+    // One warm-up connection caches the session ticket, then all
+    // iterations measure resumed handshakes.
     {
         let (server_config, client_config) = make_tls_configs(true);
         let (port, cancel) = rt.block_on(start_tls_server(server_config));
