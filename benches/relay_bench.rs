@@ -54,7 +54,7 @@ fn bench_relay(c: &mut Criterion) {
                     let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
                     let sess = session.clone();
                     let recv_handle =
-                        tokio::spawn(async move { sess.recv_loop(new_stream_tx).await });
+                        tokio::spawn(async move { sess.recv_loop(new_stream_tx, None).await });
 
                     let mut stream = new_stream_rx.recv().await.unwrap();
 

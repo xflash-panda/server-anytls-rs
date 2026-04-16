@@ -21,7 +21,7 @@ fn bench_session_throughput(c: &mut Criterion) {
                 let settings = format!("v=2\npadding-md5={}", session.padding_md5());
                 write_frame(&mut client_io, Command::Settings, 0, settings.as_bytes()).await;
                 let sess = session.clone();
-                let handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx).await });
+                let handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx, None).await });
                 write_frame(&mut client_io, Command::Syn, 1, &[]).await;
                 let mut stream = new_stream_rx.recv().await.unwrap();
                 let data = vec![0xAB_u8; 1024];

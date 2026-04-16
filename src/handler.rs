@@ -90,14 +90,9 @@ pub(crate) async fn handle_connection(server: Arc<Server>, tcp_stream: TcpStream
         }
     });
 
-    let idle_timeout = server.config.idle_timeout;
-    tokio::select! {
-        result = session.recv_loop(new_stream_tx) => result,
-        _ = tokio::time::sleep(idle_timeout) => {
-            tracing::info!("session idle timeout");
-            Ok(())
-        }
-    }
+    session
+        .recv_loop(new_stream_tx, Some(server.config.idle_timeout))
+        .await
 }
 
 #[cfg(test)]

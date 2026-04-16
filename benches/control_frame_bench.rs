@@ -60,7 +60,7 @@ fn bench_control_frame_idle(c: &mut Criterion) {
 
                 let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
                 let sess = session.clone();
-                let recv_handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx).await });
+                let recv_handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx, None).await });
 
                 // Read back ServerSettings frame first
                 read_until_command(&mut client_io, Command::ServerSettings).await;
@@ -104,7 +104,7 @@ fn bench_control_frame_under_load(c: &mut Criterion) {
 
                 let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(256);
                 let sess = session.clone();
-                let recv_handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx).await });
+                let recv_handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx, None).await });
 
                 // Read ServerSettings
                 read_until_command(&mut client_io, Command::ServerSettings).await;
