@@ -97,7 +97,7 @@ pub struct ServerBuilder {
     authenticator: Option<Arc<dyn Authenticator>>,
     stats: Option<Arc<dyn StatsCollector>>,
     router: Option<Arc<dyn OutboundRouter>>,
-    tls_config: Option<Arc<rustls::ServerConfig>>,
+    tls_config: Option<rustls::ServerConfig>,
     padding_scheme: Option<String>,
     max_connections: usize,
     max_streams_per_session: usize,
@@ -136,7 +136,7 @@ impl ServerBuilder {
         self
     }
 
-    pub fn tls_config(mut self, tls: Arc<rustls::ServerConfig>) -> Self {
+    pub fn tls_config(mut self, tls: rustls::ServerConfig) -> Self {
         self.tls_config = Some(tls);
         self
     }
@@ -188,11 +188,20 @@ impl ServerBuilder {
 
         let semaphore = Arc::new(Semaphore::new(config.max_connections));
 
+        let tls_config = self.tls_config.map(|mut tls| {
+            // Enable session tickets for TLS resumption — avoids a full
+            // handshake on reconnect, reducing latency by 1-RTT.
+            if let Ok(ticketer) = rustls::crypto::aws_lc_rs::Ticketer::new() {
+                tls.ticketer = ticketer;
+            }
+            Arc::new(tls)
+        });
+
         Server {
             authenticator,
             stats,
             router,
-            tls_config: self.tls_config,
+            tls_config,
             padding,
             config,
             semaphore,

@@ -18,14 +18,15 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 
+use rustls::HandshakeKind;
 use server_anytls_rs::core::frame::{Command, FrameHeader, HEADER_SIZE};
 use server_anytls_rs::core::padding::{DEFAULT_SCHEME, PaddingFactory};
 use server_anytls_rs::{DirectRouter, Server, SinglePasswordAuth};
 
 const PASSWORD: &str = "test-password-e2e";
 
-/// Generate a self-signed TLS certificate and return (server_config, root_cert_der).
-fn make_tls_configs() -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) {
+/// Generate a self-signed TLS certificate and return (server_config, client_config).
+fn make_tls_configs() -> (rustls::ServerConfig, Arc<rustls::ClientConfig>) {
     let subject_alt_names = vec!["localhost".to_string()];
     let cert = generate_simple_self_signed(subject_alt_names).unwrap();
 
@@ -45,7 +46,7 @@ fn make_tls_configs() -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) 
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
-    (Arc::new(server_config), Arc::new(client_config))
+    (server_config, Arc::new(client_config))
 }
 
 /// Start a simple TCP echo server. Returns the listening port.
@@ -365,6 +366,89 @@ async fn test_heartbeat() {
         }
     }
     assert!(got_heart, "did not receive HeartResponse");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_tls_session_resumption() {
+    let (tls_server_config, tls_client_config) = make_tls_configs();
+
+    let server = Arc::new(
+        Server::builder()
+            .authenticator(Arc::new(SinglePasswordAuth::new(PASSWORD)))
+            .router(Arc::new(DirectRouter))
+            .tls_config(tls_server_config)
+            .build(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_port = listener.local_addr().unwrap().port();
+    let shutdown = CancellationToken::new();
+    let shutdown_clone = shutdown.clone();
+
+    tokio::spawn(async move {
+        let _ = server.run(listener, shutdown_clone).await;
+    });
+
+    let connector = TlsConnector::from(tls_client_config.clone());
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+
+    // First connection — must be a full handshake.
+    // We send auth + settings and read back ServerSettings so the client
+    // receives the server's NewSessionTicket post-handshake message.
+    let padding = PaddingFactory::new(DEFAULT_SCHEME).unwrap();
+    let padding_md5 = padding.md5_hex().to_string();
+    {
+        let tcp = TcpStream::connect(format!("127.0.0.1:{}", server_port))
+            .await
+            .unwrap();
+        let mut tls = connector.connect(server_name.clone(), tcp).await.unwrap();
+        let (_, conn) = tls.get_ref();
+        assert_eq!(
+            conn.handshake_kind(),
+            Some(HandshakeKind::Full),
+            "first connection should be a full handshake"
+        );
+
+        // Complete the protocol handshake so session ticket is received
+        tls.write_all(&make_auth_packet(PASSWORD)).await.unwrap();
+        let settings_data = format!("v=2\npadding-md5={}", padding_md5);
+        tls.write_all(&encode_frame(
+            Command::Settings,
+            0,
+            settings_data.as_bytes(),
+        ))
+        .await
+        .unwrap();
+        tls.flush().await.unwrap();
+
+        // Read ServerSettings (this also processes any queued NewSessionTicket)
+        for _ in 0..5 {
+            if let Some((hdr, _)) = read_frame(&mut tls).await {
+                if hdr.command == Command::ServerSettings {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Brief pause so the server processes the session ticket
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Second connection — should resume via session ticket
+    {
+        let tcp = TcpStream::connect(format!("127.0.0.1:{}", server_port))
+            .await
+            .unwrap();
+        let tls = connector.connect(server_name.clone(), tcp).await.unwrap();
+        let (_, conn) = tls.get_ref();
+        assert_eq!(
+            conn.handshake_kind(),
+            Some(HandshakeKind::Resumed),
+            "second connection should use TLS session resumption"
+        );
+    }
 
     shutdown.cancel();
 }
