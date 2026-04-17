@@ -97,12 +97,18 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             let mut combined_buf = Vec::with_capacity(HEADER_SIZE + u16::MAX as usize);
             while let Some(cmd) = write_cmd_rx.recv().await {
                 let mut w = writer.lock().await;
-                if write_psh_frames(&mut *w, &cmd, &mut combined_buf).await.is_err() {
+                if write_psh_frames(&mut *w, &cmd, &mut combined_buf)
+                    .await
+                    .is_err()
+                {
                     return;
                 }
                 // Drain all pending commands without blocking (batch writes)
                 while let Ok(cmd) = write_cmd_rx.try_recv() {
-                    if write_psh_frames(&mut *w, &cmd, &mut combined_buf).await.is_err() {
+                    if write_psh_frames(&mut *w, &cmd, &mut combined_buf)
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -146,9 +152,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             }
             // Reset idle timer on every received frame.
             if let Some(d) = idle_timeout {
-                idle_sleep
-                    .as_mut()
-                    .reset(tokio::time::Instant::now() + d);
+                idle_sleep.as_mut().reset(tokio::time::Instant::now() + d);
             }
 
             let header = FrameHeader::decode(&hdr_buf);
@@ -617,9 +621,8 @@ mod tests {
         let (new_stream_tx, _) = tokio::sync::mpsc::channel(8);
         let sess = session.clone();
         let idle_timeout = std::time::Duration::from_millis(200);
-        let handle = tokio::spawn(async move {
-            sess.recv_loop(new_stream_tx, Some(idle_timeout)).await
-        });
+        let handle =
+            tokio::spawn(async move { sess.recv_loop(new_stream_tx, Some(idle_timeout)).await });
 
         // Send HeartRequest every 100ms for 500ms (well past the 200ms timeout).
         for _ in 0..5 {
@@ -637,10 +640,7 @@ mod tests {
 
         // Now stop sending.  Session should idle-timeout within ~200ms.
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
-        assert!(
-            result.is_ok(),
-            "session did not terminate after going idle"
-        );
+        assert!(result.is_ok(), "session did not terminate after going idle");
 
         drop(client_io);
     }
@@ -673,20 +673,16 @@ mod tests {
         let sess = session.clone();
         let handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx, None).await });
 
-        let _stream1 = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            new_stream_rx.recv(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        let mut stream2 = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            new_stream_rx.recv(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let _stream1 =
+            tokio::time::timeout(std::time::Duration::from_secs(1), new_stream_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        let mut stream2 =
+            tokio::time::timeout(std::time::Duration::from_secs(1), new_stream_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
 
         // Fill stream 1's channel (capacity 128) — we intentionally never read from _stream1.
         for _ in 0..130 {
@@ -697,11 +693,8 @@ mod tests {
 
         // Stream 2 should receive data even though stream 1 is backed up.
         let mut buf = [0u8; 64];
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            stream2.read(&mut buf),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(1), stream2.read(&mut buf)).await;
         assert!(
             result.is_ok(),
             "stream 2 read timed out — head-of-line blocking detected"
