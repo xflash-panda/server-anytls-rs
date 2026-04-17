@@ -66,7 +66,7 @@ pub fn init_logger(log_level_str: &str) {
 }
 
 pub mod log {
-    pub use tracing::{debug, error, info, warn};
+    pub use tracing::{debug, info, warn};
 }
 
 #[cfg(test)]

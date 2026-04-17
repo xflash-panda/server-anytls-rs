@@ -95,7 +95,9 @@ pub(crate) async fn handle_stream<T: AsyncRead + AsyncWrite + Unpin + Send + 'st
     let trailing = buf[consumed..n].to_vec();
     let outbound = server.router.route(&target).await;
     match outbound {
-        OutboundType::Direct => proxy_tcp(server, session, stream, &target, trailing, user_id).await,
+        OutboundType::Direct => {
+            proxy_tcp(server, session, stream, &target, trailing, user_id).await
+        }
         OutboundType::Reject => {
             warn!("rejecting connection to {}", target);
             let stream_id = stream.id();
@@ -154,9 +156,7 @@ async fn proxy_tcp<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         tokio::io::copy_bidirectional_with_sizes(&mut stream, &mut remote, 65536, 65536).await;
 
     if let Ok((up, down)) = relay_result {
-        server
-            .stats
-            .record_upload(user_id, up + trailing_len);
+        server.stats.record_upload(user_id, up + trailing_len);
         server.stats.record_download(user_id, down);
     }
 
@@ -294,9 +294,7 @@ mod tests {
 
         // Drain write commands from the session writer
         let (write_cmd_tx, mut write_cmd_rx) = tokio::sync::mpsc::channel::<WriteCommand>(256);
-        tokio::spawn(async move {
-            while write_cmd_rx.recv().await.is_some() {}
-        });
+        tokio::spawn(async move { while write_cmd_rx.recv().await.is_some() {} });
         let (data_tx, stream) = Stream::new(1, write_cmd_tx);
 
         // SOCKS5 IPv4 address pointing to echo server (no trailing data)
@@ -308,10 +306,7 @@ mod tests {
         let mut addr_data = vec![0x01];
         addr_data.extend_from_slice(&ip);
         addr_data.extend_from_slice(&port.to_be_bytes());
-        data_tx
-            .send(bytes::Bytes::from(addr_data))
-            .await
-            .unwrap();
+        data_tx.send(bytes::Bytes::from(addr_data)).await.unwrap();
 
         // Payload that goes through copy_bidirectional
         let payload = b"hello world test data";

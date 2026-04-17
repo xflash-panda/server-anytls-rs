@@ -419,7 +419,10 @@ mod tests {
         .await;
         let (new_stream_tx, _) = tokio::sync::mpsc::channel(8);
         let sess = session.clone();
-        let handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx, None, CancellationToken::new()).await });
+        let handle = tokio::spawn(async move {
+            sess.recv_loop(new_stream_tx, None, CancellationToken::new())
+                .await
+        });
         drop(client_io);
         let _ = handle.await;
     }
@@ -443,7 +446,10 @@ mod tests {
         )
         .await;
         let sess = session.clone();
-        let handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx, None, CancellationToken::new()).await });
+        let handle = tokio::spawn(async move {
+            sess.recv_loop(new_stream_tx, None, CancellationToken::new())
+                .await
+        });
         write_frame(&mut client_io, Command::Syn, 1, &[]).await;
         let stream = tokio::time::timeout(std::time::Duration::from_secs(1), new_stream_rx.recv())
             .await
@@ -473,7 +479,10 @@ mod tests {
         )
         .await;
         let sess = session.clone();
-        let handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx, None, CancellationToken::new()).await });
+        let handle = tokio::spawn(async move {
+            sess.recv_loop(new_stream_tx, None, CancellationToken::new())
+                .await
+        });
         write_frame(&mut client_io, Command::Syn, 1, &[]).await;
         let mut stream =
             tokio::time::timeout(std::time::Duration::from_secs(1), new_stream_rx.recv())
@@ -513,7 +522,10 @@ mod tests {
         )
         .await;
         let sess = session.clone();
-        let handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx, None, CancellationToken::new()).await });
+        let handle = tokio::spawn(async move {
+            sess.recv_loop(new_stream_tx, None, CancellationToken::new())
+                .await
+        });
 
         // Send a HeartRequest — server should respond with HeartResponse
         write_frame(&mut client_io, Command::HeartRequest, 0, &[]).await;
@@ -570,7 +582,10 @@ mod tests {
         )
         .await;
         let sess = session.clone();
-        let handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx, None, CancellationToken::new()).await });
+        let handle = tokio::spawn(async move {
+            sess.recv_loop(new_stream_tx, None, CancellationToken::new())
+                .await
+        });
         write_frame(&mut client_io, Command::HeartRequest, 0, &[]).await;
         // Read frames back — may get ServerSettings first, then HeartResponse
         let mut found_heart = false;
@@ -638,8 +653,7 @@ mod tests {
         // Cancel the token — recv_loop should exit promptly
         cancel_token.cancel();
 
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
         assert!(
             result.is_ok(),
             "recv_loop did not exit after cancel_token was cancelled"
@@ -671,8 +685,10 @@ mod tests {
         let (new_stream_tx, _) = tokio::sync::mpsc::channel(8);
         let sess = session.clone();
         let idle_timeout = std::time::Duration::from_millis(200);
-        let handle =
-            tokio::spawn(async move { sess.recv_loop(new_stream_tx, Some(idle_timeout), CancellationToken::new()).await });
+        let handle = tokio::spawn(async move {
+            sess.recv_loop(new_stream_tx, Some(idle_timeout), CancellationToken::new())
+                .await
+        });
 
         // Send HeartRequest every 100ms for 500ms (well past the 200ms timeout).
         for _ in 0..5 {
@@ -721,7 +737,10 @@ mod tests {
 
         let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
         let sess = session.clone();
-        let handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx, None, CancellationToken::new()).await });
+        let handle = tokio::spawn(async move {
+            sess.recv_loop(new_stream_tx, None, CancellationToken::new())
+                .await
+        });
 
         let _stream1 =
             tokio::time::timeout(std::time::Duration::from_secs(1), new_stream_rx.recv())

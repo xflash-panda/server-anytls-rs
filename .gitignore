@@ -1,5 +1,6 @@
 /target
 docs/
+.cert/
 
 # Claude
 CLAUDE.md
