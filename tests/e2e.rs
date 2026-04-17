@@ -7,7 +7,7 @@
 //!    opens a stream (SYN) with SOCKS5 address pointing to the echo server,
 //!    sends data (PSH), and reads back the echoed response.
 
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use rcgen::generate_simple_self_signed;
@@ -25,8 +25,19 @@ use server_anytls_rs::{DirectRouter, Server, SinglePasswordAuth};
 
 const PASSWORD: &str = "test-password-e2e";
 
+static INIT_CRYPTO: Once = Once::new();
+
+fn install_crypto_provider() {
+    INIT_CRYPTO.call_once(|| {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .expect("Failed to install CryptoProvider");
+    });
+}
+
 /// Generate a self-signed TLS certificate and return (server_config, client_config).
 fn make_tls_configs() -> (rustls::ServerConfig, Arc<rustls::ClientConfig>) {
+    install_crypto_provider();
     let subject_alt_names = vec!["localhost".to_string()];
     let cert = generate_simple_self_signed(subject_alt_names).unwrap();
 
