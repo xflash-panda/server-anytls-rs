@@ -14,6 +14,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
   BINARY_NAME: server-anytls
 
 jobs:
@@ -33,6 +34,9 @@ jobs:
             os: macos-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Configure git auth for private deps
+        run: git config --global url."https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/".insteadOf "https://github.com/"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
