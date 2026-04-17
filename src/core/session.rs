@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::core::frame::{Command, FrameHeader, HEADER_SIZE};
@@ -85,6 +86,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
         self: Arc<Self>,
         new_stream_tx: mpsc::Sender<Stream>,
         idle_timeout: Option<std::time::Duration>,
+        cancel_token: CancellationToken,
     ) -> Result<()> {
         let mut streams: FxHashMap<u32, mpsc::Sender<Bytes>> = FxHashMap::default();
         let mut settings_received = false;
@@ -124,23 +126,23 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
         let mut payload_buf = BytesMut::with_capacity(u16::MAX as usize);
 
         // Idle timeout: when enabled, a pinned Sleep resets after every
-        // received frame.  When disabled (None), we skip tokio::select!
-        // entirely to avoid timer-wheel overhead on the hot path.
+        // received frame.  When disabled (None), we use a future that never
+        // completes so a single select! handles both cases without duplication.
         let idle_sleep = tokio::time::sleep(idle_timeout.unwrap_or_default());
         tokio::pin!(idle_sleep);
 
         loop {
             let mut hdr_buf = [0u8; HEADER_SIZE];
-            let read_result = if idle_timeout.is_some() {
-                tokio::select! {
-                    r = reader.read_exact(&mut hdr_buf) => r,
-                    _ = &mut idle_sleep => {
-                        debug!("session idle timeout");
-                        break;
-                    }
+            let read_result = tokio::select! {
+                r = reader.read_exact(&mut hdr_buf) => r,
+                _ = &mut idle_sleep, if idle_timeout.is_some() => {
+                    debug!("session idle timeout");
+                    break;
                 }
-            } else {
-                reader.read_exact(&mut hdr_buf).await
+                _ = cancel_token.cancelled() => {
+                    debug!("session cancelled by connection manager");
+                    break;
+                }
             };
             match read_result {
                 Ok(_) => {}
@@ -372,6 +374,7 @@ mod tests {
     use crate::core::frame::{Command, FrameHeader, HEADER_SIZE};
     use crate::core::padding::{DEFAULT_SCHEME, PaddingFactory};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+    use tokio_util::sync::CancellationToken;
 
     fn test_padding() -> PaddingFactory {
         PaddingFactory::new(DEFAULT_SCHEME).unwrap()
@@ -416,7 +419,7 @@ mod tests {
         .await;
         let (new_stream_tx, _) = tokio::sync::mpsc::channel(8);
         let sess = session.clone();
-        let handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx, None).await });
+        let handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx, None, CancellationToken::new()).await });
         drop(client_io);
         let _ = handle.await;
     }
@@ -440,7 +443,7 @@ mod tests {
         )
         .await;
         let sess = session.clone();
-        let handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx, None).await });
+        let handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx, None, CancellationToken::new()).await });
         write_frame(&mut client_io, Command::Syn, 1, &[]).await;
         let stream = tokio::time::timeout(std::time::Duration::from_secs(1), new_stream_rx.recv())
             .await
@@ -470,7 +473,7 @@ mod tests {
         )
         .await;
         let sess = session.clone();
-        let handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx, None).await });
+        let handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx, None, CancellationToken::new()).await });
         write_frame(&mut client_io, Command::Syn, 1, &[]).await;
         let mut stream =
             tokio::time::timeout(std::time::Duration::from_secs(1), new_stream_rx.recv())
@@ -510,7 +513,7 @@ mod tests {
         )
         .await;
         let sess = session.clone();
-        let handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx, None).await });
+        let handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx, None, CancellationToken::new()).await });
 
         // Send a HeartRequest — server should respond with HeartResponse
         write_frame(&mut client_io, Command::HeartRequest, 0, &[]).await;
@@ -567,7 +570,7 @@ mod tests {
         )
         .await;
         let sess = session.clone();
-        let handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx, None).await });
+        let handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx, None, CancellationToken::new()).await });
         write_frame(&mut client_io, Command::HeartRequest, 0, &[]).await;
         // Read frames back — may get ServerSettings first, then HeartResponse
         let mut found_heart = false;
@@ -598,6 +601,53 @@ mod tests {
         let _ = handle.await;
     }
 
+    /// recv_loop must exit promptly when a CancellationToken is cancelled,
+    /// even if the connection is otherwise healthy and active.
+    #[tokio::test]
+    async fn test_recv_loop_exits_on_cancel_token() {
+        let (mut client_io, server_io) = duplex(65536);
+        let padding = test_padding();
+        let session = Arc::new(Session::new_server(
+            server_io,
+            padding,
+            SessionConfig::default(),
+        ));
+        let settings_data = format!("v=2\npadding-md5={}", session.padding_md5());
+        write_frame(
+            &mut client_io,
+            Command::Settings,
+            0,
+            settings_data.as_bytes(),
+        )
+        .await;
+
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let (new_stream_tx, _) = tokio::sync::mpsc::channel(8);
+        let sess = session.clone();
+        let ct = cancel_token.clone();
+        let handle = tokio::spawn(async move {
+            sess.recv_loop(new_stream_tx, Some(std::time::Duration::from_secs(300)), ct)
+                .await
+        });
+
+        // Connection is alive — send a heartbeat to confirm
+        write_frame(&mut client_io, Command::HeartRequest, 0, &[]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!handle.is_finished(), "session should still be running");
+
+        // Cancel the token — recv_loop should exit promptly
+        cancel_token.cancel();
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        assert!(
+            result.is_ok(),
+            "recv_loop did not exit after cancel_token was cancelled"
+        );
+
+        drop(client_io);
+    }
+
     /// Active connections must survive past the idle timeout duration.
     /// Idle timeout should reset on every received frame, not be a fixed timer.
     #[tokio::test]
@@ -622,7 +672,7 @@ mod tests {
         let sess = session.clone();
         let idle_timeout = std::time::Duration::from_millis(200);
         let handle =
-            tokio::spawn(async move { sess.recv_loop(new_stream_tx, Some(idle_timeout)).await });
+            tokio::spawn(async move { sess.recv_loop(new_stream_tx, Some(idle_timeout), CancellationToken::new()).await });
 
         // Send HeartRequest every 100ms for 500ms (well past the 200ms timeout).
         for _ in 0..5 {
@@ -671,7 +721,7 @@ mod tests {
 
         let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
         let sess = session.clone();
-        let handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx, None).await });
+        let handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx, None, CancellationToken::new()).await });
 
         let _stream1 =
             tokio::time::timeout(std::time::Duration::from_secs(1), new_stream_rx.recv())

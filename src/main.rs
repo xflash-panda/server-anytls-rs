@@ -14,7 +14,7 @@ use crate::business::{
     PanelConfig, PanelStatsCollector, TaskConfig,
 };
 use panel_core::PanelApi;
-use server_anytls_rs::{OutboundRouter, StatsCollector};
+use server_anytls_rs::{ConnectionManager, OutboundRouter, StatsCollector};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -90,12 +90,14 @@ async fn main() -> Result<()> {
     let authenticator = Arc::new(AnyTlsAuthenticator(Arc::clone(&user_manager)));
     let stats_collector = Arc::new(PanelStatsCollector::new());
     let anytls_stats = Arc::new(AnyTlsStatsCollector(Arc::clone(&stats_collector)));
+    let connection_manager = ConnectionManager::new();
 
     let mut builder = server_anytls_rs::Server::builder()
         .authenticator(authenticator)
         .stats(anytls_stats as Arc<dyn StatsCollector>)
         .router(router)
         .tls_config(tls_config)
+        .connection_manager(connection_manager.clone())
         .max_connections(cli.max_connections);
 
     if let Some(ref rules) = remote_config.padding_rules
@@ -106,18 +108,28 @@ async fn main() -> Result<()> {
 
     let server = Arc::new(builder.build());
 
-    // Start background tasks
+    // Start background tasks with user kick callback
     let task_config = TaskConfig::new(
         cli.fetch_users_interval,
         cli.report_traffics_interval,
         cli.heartbeat_interval,
     );
+    let conn_mgr_for_kick = connection_manager.clone();
+    let on_diff = Arc::new(move |diff: panel_core::UserDiff| {
+        for uid in diff.removed_ids.iter().chain(diff.uuid_changed_ids.iter()) {
+            let kicked = conn_mgr_for_kick.kick_user(*uid);
+            if kicked > 0 {
+                log::info!(user_id = uid, kicked, "Kicked user connections");
+            }
+        }
+    });
     let background_tasks = BackgroundTasks::new(
         task_config,
         Arc::clone(&api_manager),
         Arc::clone(&user_manager),
         Arc::clone(&stats_collector),
-    );
+    )
+    .on_user_diff(on_diff);
     let background_handle = background_tasks.start();
 
     // Bind listener
@@ -158,6 +170,21 @@ async fn main() -> Result<()> {
 
     // Graceful shutdown
     log::info!("Server stopped, performing graceful shutdown...");
+
+    // Cancel all active connections and wait for them to drain
+    let active = connection_manager.connection_count();
+    if active > 0 {
+        log::info!(active, "Draining active connections");
+        connection_manager
+            .shutdown_drain(std::time::Duration::from_secs(5))
+            .await;
+        let remaining = connection_manager.connection_count();
+        if remaining > 0 {
+            log::warn!(remaining, "Drain timeout, forcing shutdown");
+        } else {
+            log::info!("All connections drained");
+        }
+    }
 
     if let Ok(api_for_shutdown) = shutdown_handle.await {
         log::info!("Unregistering node...");

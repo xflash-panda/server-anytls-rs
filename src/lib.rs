@@ -7,6 +7,7 @@ pub mod handler;
 pub mod outbound;
 
 // Convenience re-exports
+pub use core::connection::ConnectionManager;
 pub use core::hooks::{
     Address, Authenticator, DirectRouter, NoopStatsCollector, OutboundRouter, OutboundType,
     SinglePasswordAuth, StatsCollector, UserId,

@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use std::net::SocketAddr;
+
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, mpsc};
@@ -48,7 +50,11 @@ pub(crate) async fn read_auth<R: AsyncRead + Unpin>(
     Ok(user_id)
 }
 
-pub(crate) async fn handle_connection(server: Arc<Server>, tcp_stream: TcpStream) -> Result<()> {
+pub(crate) async fn handle_connection(
+    server: Arc<Server>,
+    tcp_stream: TcpStream,
+    peer_addr: SocketAddr,
+) -> Result<()> {
     let tls_config = server
         .tls_config
         .clone()
@@ -60,9 +66,18 @@ pub(crate) async fn handle_connection(server: Arc<Server>, tcp_stream: TcpStream
     let mut buf_stream = tokio::io::BufReader::new(tls_stream);
     let user_id = read_auth(&mut buf_stream, server.authenticator.as_ref()).await?;
 
-    if user_id.is_none() {
-        return Err(Error::AuthFailed);
-    }
+    let user_id = match user_id {
+        Some(uid) => uid,
+        None => return Err(Error::AuthFailed),
+    };
+
+    // Register connection after successful authentication
+    let (conn_id, cancel_token) = server.connection_manager.register(user_id, peer_addr);
+    // Ensure unregister on exit (even on panic)
+    let conn_mgr = server.connection_manager.clone();
+    let _guard = scopeguard::guard(conn_id, move |id| {
+        conn_mgr.unregister(id);
+    });
 
     let tls_stream = buf_stream.into_inner();
 
@@ -91,7 +106,7 @@ pub(crate) async fn handle_connection(server: Arc<Server>, tcp_stream: TcpStream
     });
 
     session
-        .recv_loop(new_stream_tx, Some(server.config.idle_timeout))
+        .recv_loop(new_stream_tx, Some(server.config.idle_timeout), cancel_token)
         .await
 }
 

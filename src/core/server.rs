@@ -5,6 +5,8 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+use crate::core::connection::ConnectionManager;
+
 use crate::core::hooks::{Authenticator, NoopStatsCollector, OutboundRouter, StatsCollector};
 use crate::core::padding::{DEFAULT_SCHEME, PaddingFactory};
 use crate::core::session::SessionConfig;
@@ -44,11 +46,16 @@ pub struct Server {
     pub(crate) padding: PaddingFactory,
     pub(crate) config: ServerConfig,
     pub(crate) semaphore: Arc<Semaphore>,
+    pub(crate) connection_manager: ConnectionManager,
 }
 
 impl Server {
     pub fn builder() -> ServerBuilder {
         ServerBuilder::new()
+    }
+
+    pub fn connection_manager(&self) -> &ConnectionManager {
+        &self.connection_manager
     }
 
     pub fn session_config(&self) -> SessionConfig {
@@ -77,7 +84,7 @@ impl Server {
                     let server = self.clone();
                     tokio::spawn(async move {
                         tracing::debug!("new connection from {}", peer_addr);
-                        if let Err(e) = crate::handler::handle_connection(server, tcp_stream).await {
+                        if let Err(e) = crate::handler::handle_connection(server, tcp_stream, peer_addr).await {
                             tracing::debug!("connection from {} ended: {}", peer_addr, e);
                         }
                         drop(permit);
@@ -99,6 +106,7 @@ pub struct ServerBuilder {
     router: Option<Arc<dyn OutboundRouter>>,
     tls_config: Option<rustls::ServerConfig>,
     padding_scheme: Option<String>,
+    connection_manager: Option<ConnectionManager>,
     max_connections: usize,
     max_streams_per_session: usize,
     tcp_connect_timeout: Duration,
@@ -114,6 +122,7 @@ impl ServerBuilder {
             router: None,
             tls_config: None,
             padding_scheme: None,
+            connection_manager: None,
             max_connections: defaults.max_connections,
             max_streams_per_session: defaults.max_streams_per_session,
             tcp_connect_timeout: defaults.tcp_connect_timeout,
@@ -138,6 +147,11 @@ impl ServerBuilder {
 
     pub fn tls_config(mut self, tls: rustls::ServerConfig) -> Self {
         self.tls_config = Some(tls);
+        self
+    }
+
+    pub fn connection_manager(mut self, cm: ConnectionManager) -> Self {
+        self.connection_manager = Some(cm);
         self
     }
 
@@ -198,6 +212,8 @@ impl ServerBuilder {
             Arc::new(tls)
         });
 
+        let connection_manager = self.connection_manager.unwrap_or_default();
+
         Server {
             authenticator,
             stats,
@@ -206,6 +222,7 @@ impl ServerBuilder {
             padding,
             config,
             semaphore,
+            connection_manager,
         }
     }
 }
