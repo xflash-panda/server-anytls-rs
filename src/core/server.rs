@@ -20,6 +20,7 @@ pub struct ServerConfig {
     pub max_streams_per_session: usize,
     pub tcp_connect_timeout: Duration,
     pub idle_timeout: Duration,
+    pub handshake_timeout: Duration,
 }
 
 impl Default for ServerConfig {
@@ -29,6 +30,7 @@ impl Default for ServerConfig {
             max_streams_per_session: 256,
             tcp_connect_timeout: Duration::from_secs(5),
             idle_timeout: Duration::from_secs(300),
+            handshake_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -110,6 +112,7 @@ pub struct ServerBuilder {
     max_streams_per_session: usize,
     tcp_connect_timeout: Duration,
     idle_timeout: Duration,
+    handshake_timeout: Duration,
 }
 
 impl ServerBuilder {
@@ -126,6 +129,7 @@ impl ServerBuilder {
             max_streams_per_session: defaults.max_streams_per_session,
             tcp_connect_timeout: defaults.tcp_connect_timeout,
             idle_timeout: defaults.idle_timeout,
+            handshake_timeout: defaults.handshake_timeout,
         }
     }
 
@@ -179,6 +183,11 @@ impl ServerBuilder {
         self
     }
 
+    pub fn handshake_timeout(mut self, d: Duration) -> Self {
+        self.handshake_timeout = d;
+        self
+    }
+
     pub fn build(self) -> Server {
         let authenticator = self.authenticator.expect("authenticator is required");
 
@@ -197,6 +206,7 @@ impl ServerBuilder {
             max_streams_per_session: self.max_streams_per_session,
             tcp_connect_timeout: self.tcp_connect_timeout,
             idle_timeout: self.idle_timeout,
+            handshake_timeout: self.handshake_timeout,
         };
 
         let semaphore = Arc::new(Semaphore::new(config.max_connections));
@@ -242,6 +252,7 @@ mod tests {
             .build();
         assert_eq!(server.config.max_connections, 10000);
         assert_eq!(server.config.max_streams_per_session, 256);
+        assert_eq!(server.config.handshake_timeout, Duration::from_secs(10));
     }
 
     #[test]

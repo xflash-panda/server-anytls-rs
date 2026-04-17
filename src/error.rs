@@ -26,6 +26,9 @@ pub enum Error {
     #[error("max connections exceeded")]
     MaxConnectionsExceeded,
 
+    #[error("handshake timeout")]
+    HandshakeTimeout,
+
     #[error("padding scheme parse error: {0}")]
     PaddingParse(String),
 }

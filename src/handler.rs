@@ -61,15 +61,21 @@ pub(crate) async fn handle_connection(
         .ok_or_else(|| Error::Tls(rustls::Error::General("no TLS config".into())))?;
 
     let acceptor = TlsAcceptor::from(tls_config);
-    let tls_stream = acceptor.accept(tcp_stream).await?;
 
-    let mut buf_stream = tokio::io::BufReader::new(tls_stream);
-    let user_id = read_auth(&mut buf_stream, server.authenticator.as_ref()).await?;
-
-    let user_id = match user_id {
-        Some(uid) => uid,
-        None => return Err(Error::AuthFailed),
-    };
+    // Wrap TLS handshake + auth read in a single timeout to prevent
+    // slowloris-style attacks from holding semaphore permits indefinitely.
+    let (buf_stream, user_id) = tokio::time::timeout(server.config.handshake_timeout, async {
+        let tls_stream = acceptor.accept(tcp_stream).await?;
+        let mut buf_stream = tokio::io::BufReader::new(tls_stream);
+        let user_id = read_auth(&mut buf_stream, server.authenticator.as_ref()).await?;
+        let user_id = match user_id {
+            Some(uid) => uid,
+            None => return Err(Error::AuthFailed),
+        };
+        Ok::<_, Error>((buf_stream, user_id))
+    })
+    .await
+    .map_err(|_| Error::HandshakeTimeout)??;
 
     // Register connection after successful authentication
     let (conn_id, cancel_token) = server.connection_manager.register(user_id, peer_addr);
@@ -177,6 +183,21 @@ mod tests {
         let auth = SinglePasswordAuth::new("mypassword");
         let result = read_auth(&mut reader, &auth).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_read_auth_timeout_on_stalled_reader() {
+        use std::time::Duration;
+        // A reader that never sends data should be caught by timeout
+        let (_writer, reader) = tokio::io::duplex(4096);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let auth = SinglePasswordAuth::new("mypassword");
+
+        let result =
+            tokio::time::timeout(Duration::from_millis(100), read_auth(&mut reader, &auth)).await;
+
+        // Outer Result is Err(Elapsed) = timeout fired
+        assert!(result.is_err(), "expected timeout on stalled reader");
     }
 
     #[tokio::test]
