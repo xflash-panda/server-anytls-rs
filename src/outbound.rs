@@ -1,7 +1,10 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tracing::{info, warn};
 
@@ -68,6 +71,45 @@ pub(crate) fn is_udp_over_tcp(addr: &Address) -> bool {
     }
 }
 
+/// Wrapper that counts bytes written through an `AsyncWrite`.
+struct CountedWrite<W> {
+    inner: W,
+    bytes_written: Arc<AtomicU64>,
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for CountedWrite<W> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &result {
+            this.bytes_written.fetch_add(*n as u64, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+impl<W: AsyncRead + Unpin> AsyncRead for CountedWrite<W> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
 /// Main entry point called by the session handler for each new stream.
 pub(crate) async fn handle_stream<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     server: Arc<Server>,
@@ -114,7 +156,7 @@ pub(crate) async fn handle_stream<T: AsyncRead + AsyncWrite + Unpin + Send + 'st
 async fn proxy_tcp<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     server: Arc<Server>,
     session: Arc<Session<T>>,
-    mut stream: Stream,
+    stream: Stream,
     target: &Address,
     trailing: Vec<u8>,
     user_id: UserId,
@@ -152,11 +194,33 @@ async fn proxy_tcp<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         remote.write_all(&trailing).await?;
     }
 
-    let relay_result =
-        tokio::io::copy_bidirectional_with_sizes(&mut stream, &mut remote, 65536, 65536).await;
+    // Wrap remote with byte counters so traffic is tracked even if the relay errors.
+    // upload = bytes written to remote (client → remote)
+    // download = bytes written to stream (remote → client)
+    let upload_bytes = Arc::new(AtomicU64::new(0));
+    let download_bytes = Arc::new(AtomicU64::new(0));
 
-    if let Ok((up, down)) = relay_result {
-        server.stats.record_upload(user_id, up + trailing_len);
+    let mut counted_remote = CountedWrite {
+        inner: remote,
+        bytes_written: upload_bytes.clone(),
+    };
+    let mut counted_stream = CountedWrite {
+        inner: stream,
+        bytes_written: download_bytes.clone(),
+    };
+
+    let _relay_result = tokio::io::copy_bidirectional_with_sizes(
+        &mut counted_stream,
+        &mut counted_remote,
+        65536,
+        65536,
+    )
+    .await;
+
+    let up = upload_bytes.load(Ordering::Relaxed) + trailing_len;
+    let down = download_bytes.load(Ordering::Relaxed);
+    if up > 0 || down > 0 {
+        server.stats.record_upload(user_id, up);
         server.stats.record_download(user_id, down);
     }
 
@@ -236,6 +300,112 @@ mod tests {
         assert!(!is_udp_over_tcp(&addr));
         let addr = Address::IPv4([1, 2, 3, 4], 80);
         assert!(!is_udp_over_tcp(&addr));
+    }
+
+    /// When `copy_bidirectional` errors mid-relay (e.g. connection reset),
+    /// partial traffic should still be recorded.
+    #[tokio::test]
+    async fn test_handle_stream_records_traffic_on_relay_error() {
+        use crate::core::hooks::{DirectRouter, SinglePasswordAuth, StatsCollector, UserId};
+        use crate::core::padding::{DEFAULT_SCHEME, PaddingFactory};
+        use crate::core::server::Server;
+        use crate::core::session::{Session, SessionConfig};
+        use crate::core::stream::{Stream, WriteCommand};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct RecordingStats {
+            upload: AtomicU64,
+            download: AtomicU64,
+        }
+        impl StatsCollector for RecordingStats {
+            fn record_upload(&self, _uid: UserId, bytes: u64) {
+                self.upload.fetch_add(bytes, Ordering::Relaxed);
+            }
+            fn record_download(&self, _uid: UserId, bytes: u64) {
+                self.download.fetch_add(bytes, Ordering::Relaxed);
+            }
+        }
+
+        // TCP server that reads some data, sends some back, then RSTs
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let std_stream = stream.into_std().unwrap();
+                // Read whatever is available
+                use std::io::Read;
+                let mut s = std_stream;
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                // Write some data back
+                use std::io::Write;
+                let _ = s.write_all(b"response-data-here");
+                // RST the connection: linger(0) + drop sends TCP RST
+                let sock = socket2::Socket::from(s);
+                let _ = sock.set_linger(Some(std::time::Duration::from_secs(0)));
+                drop(sock);
+            }
+        });
+
+        let recording = Arc::new(RecordingStats {
+            upload: AtomicU64::new(0),
+            download: AtomicU64::new(0),
+        });
+
+        let server = Arc::new(
+            Server::builder()
+                .authenticator(Arc::new(SinglePasswordAuth::new("test")))
+                .stats(recording.clone() as Arc<dyn StatsCollector>)
+                .router(Arc::new(DirectRouter))
+                .build(),
+        );
+
+        let (_client_io, server_io) = tokio::io::duplex(65536);
+        let padding = PaddingFactory::new(DEFAULT_SCHEME).unwrap();
+        let session = Arc::new(Session::new_server(
+            server_io,
+            padding,
+            SessionConfig::default(),
+        ));
+
+        let (write_cmd_tx, mut write_cmd_rx) = tokio::sync::mpsc::channel::<WriteCommand>(256);
+        tokio::spawn(async move { while write_cmd_rx.recv().await.is_some() {} });
+        let (data_tx, stream) = Stream::new(1, write_cmd_tx);
+
+        // SOCKS5 IPv4 address pointing to our RST server + trailing payload
+        let ip = match echo_addr {
+            std::net::SocketAddr::V4(v4) => v4.ip().octets(),
+            _ => panic!("expected v4"),
+        };
+        let port = echo_addr.port();
+        let mut addr_and_payload = vec![0x01];
+        addr_and_payload.extend_from_slice(&ip);
+        addr_and_payload.extend_from_slice(&port.to_be_bytes());
+        // Append trailing payload that counts as upload
+        addr_and_payload.extend_from_slice(b"trailing-upload-data");
+        data_tx
+            .send(bytes::Bytes::from(addr_and_payload))
+            .await
+            .unwrap();
+
+        // Send more data then close
+        data_tx
+            .send(bytes::Bytes::from_static(b"more-upload-data"))
+            .await
+            .unwrap();
+        // Small delay to let data flow before closing
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(data_tx);
+
+        let _ = handle_stream(server, session, stream, 42).await;
+
+        let up = recording.upload.load(Ordering::Relaxed);
+        let down = recording.download.load(Ordering::Relaxed);
+        // Even though the relay errored, traffic should be recorded
+        assert!(
+            up > 0 || down > 0,
+            "expected some traffic to be recorded on relay error, got upload={up} download={down}"
+        );
     }
 
     #[tokio::test]
