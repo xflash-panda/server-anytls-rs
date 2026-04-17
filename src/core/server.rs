@@ -39,7 +39,6 @@ impl Default for ServerConfig {
 
 pub struct Server {
     pub(crate) authenticator: Arc<dyn Authenticator>,
-    #[allow(dead_code)]
     pub(crate) stats: Arc<dyn StatsCollector>,
     pub(crate) router: Arc<dyn OutboundRouter>,
     pub(crate) tls_config: Option<Arc<rustls::ServerConfig>>,

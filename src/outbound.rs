@@ -5,7 +5,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{info, warn};
 
-use crate::core::hooks::{Address, OutboundType};
+use crate::core::hooks::{Address, OutboundType, UserId};
 use crate::core::server::Server;
 use crate::core::session::Session;
 use crate::core::stream::Stream;
@@ -73,6 +73,7 @@ pub(crate) async fn handle_stream<T: AsyncRead + AsyncWrite + Unpin + Send + 'st
     server: Arc<Server>,
     session: Arc<Session<T>>,
     mut stream: Stream,
+    user_id: UserId,
 ) -> Result<()> {
     // Read the first chunk from the stream to get the SOCKS5 destination address.
     let mut buf = vec![0u8; 512];
@@ -94,7 +95,7 @@ pub(crate) async fn handle_stream<T: AsyncRead + AsyncWrite + Unpin + Send + 'st
     let trailing = buf[consumed..n].to_vec();
     let outbound = server.router.route(&target).await;
     match outbound {
-        OutboundType::Direct => proxy_tcp(server, session, stream, &target, trailing).await,
+        OutboundType::Direct => proxy_tcp(server, session, stream, &target, trailing, user_id).await,
         OutboundType::Reject => {
             warn!("rejecting connection to {}", target);
             let stream_id = stream.id();
@@ -114,6 +115,7 @@ async fn proxy_tcp<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut stream: Stream,
     target: &Address,
     trailing: Vec<u8>,
+    user_id: UserId,
 ) -> Result<()> {
     let stream_id = stream.id();
     let addr_str = target.to_socket_string();
@@ -143,11 +145,20 @@ async fn proxy_tcp<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     session.handshake_success(stream_id).await?;
 
     // Forward any application data that was read alongside the SOCKS address.
+    let trailing_len = trailing.len() as u64;
     if !trailing.is_empty() {
         remote.write_all(&trailing).await?;
     }
 
-    let _ = tokio::io::copy_bidirectional_with_sizes(&mut stream, &mut remote, 65536, 65536).await;
+    let relay_result =
+        tokio::io::copy_bidirectional_with_sizes(&mut stream, &mut remote, 65536, 65536).await;
+
+    if let Ok((up, down)) = relay_result {
+        server
+            .stats
+            .record_upload(user_id, up + trailing_len);
+        server.stats.record_download(user_id, down);
+    }
 
     session.send_fin(stream_id).await?;
 
@@ -225,5 +236,96 @@ mod tests {
         assert!(!is_udp_over_tcp(&addr));
         let addr = Address::IPv4([1, 2, 3, 4], 80);
         assert!(!is_udp_over_tcp(&addr));
+    }
+
+    #[tokio::test]
+    async fn test_handle_stream_records_traffic_stats() {
+        use crate::core::hooks::{DirectRouter, SinglePasswordAuth, StatsCollector, UserId};
+        use crate::core::padding::{DEFAULT_SCHEME, PaddingFactory};
+        use crate::core::server::Server;
+        use crate::core::session::{Session, SessionConfig};
+        use crate::core::stream::{Stream, WriteCommand};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct RecordingStats {
+            upload: AtomicU64,
+            download: AtomicU64,
+        }
+        impl StatsCollector for RecordingStats {
+            fn record_upload(&self, _uid: UserId, bytes: u64) {
+                self.upload.fetch_add(bytes, Ordering::Relaxed);
+            }
+            fn record_download(&self, _uid: UserId, bytes: u64) {
+                self.download.fetch_add(bytes, Ordering::Relaxed);
+            }
+        }
+
+        // Echo server
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = echo.accept().await {
+                let (mut r, mut w) = s.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            }
+        });
+
+        let recording = Arc::new(RecordingStats {
+            upload: AtomicU64::new(0),
+            download: AtomicU64::new(0),
+        });
+
+        let server = Arc::new(
+            Server::builder()
+                .authenticator(Arc::new(SinglePasswordAuth::new("test")))
+                .stats(recording.clone() as Arc<dyn StatsCollector>)
+                .router(Arc::new(DirectRouter))
+                .build(),
+        );
+
+        // Session over duplex
+        let (_client_io, server_io) = tokio::io::duplex(65536);
+        let padding = PaddingFactory::new(DEFAULT_SCHEME).unwrap();
+        let session = Arc::new(Session::new_server(
+            server_io,
+            padding,
+            SessionConfig::default(),
+        ));
+
+        // Drain write commands from the session writer
+        let (write_cmd_tx, mut write_cmd_rx) = tokio::sync::mpsc::channel::<WriteCommand>(256);
+        tokio::spawn(async move {
+            while write_cmd_rx.recv().await.is_some() {}
+        });
+        let (data_tx, stream) = Stream::new(1, write_cmd_tx);
+
+        // SOCKS5 IPv4 address pointing to echo server (no trailing data)
+        let ip = match echo_addr {
+            std::net::SocketAddr::V4(v4) => v4.ip().octets(),
+            _ => panic!("expected v4"),
+        };
+        let port = echo_addr.port();
+        let mut addr_data = vec![0x01];
+        addr_data.extend_from_slice(&ip);
+        addr_data.extend_from_slice(&port.to_be_bytes());
+        data_tx
+            .send(bytes::Bytes::from(addr_data))
+            .await
+            .unwrap();
+
+        // Payload that goes through copy_bidirectional
+        let payload = b"hello world test data";
+        data_tx
+            .send(bytes::Bytes::from_static(payload))
+            .await
+            .unwrap();
+        drop(data_tx); // EOF → copy_bidirectional finishes
+
+        let _ = handle_stream(server, session, stream, 42).await;
+
+        let up = recording.upload.load(Ordering::Relaxed);
+        let down = recording.download.load(Ordering::Relaxed);
+        assert!(up > 0, "expected upload bytes to be recorded, got 0");
+        assert!(down > 0, "expected download bytes to be recorded, got 0");
     }
 }
