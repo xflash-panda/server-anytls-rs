@@ -105,6 +105,14 @@ harness = false
 name = "padding_clone_bench"
 harness = false
 
+[[bench]]
+name = "channel_pressure_bench"
+harness = false
+
+[[bench]]
+name = "write_cmd_capacity_bench"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "fat"
