@@ -205,17 +205,17 @@ async fn proxy_tcp_via_handler<T: AsyncRead + AsyncWrite + Unpin + Send + 'stati
     let stream_id = stream.id();
     let mut acl_addr = Addr::new(target.host_string(), target.port());
 
-    let connect_result =
-        tokio::time::timeout(server.config.tcp_connect_timeout, handler.dial_tcp(&mut acl_addr))
-            .await;
+    let connect_result = tokio::time::timeout(
+        server.config.tcp_connect_timeout,
+        handler.dial_tcp(&mut acl_addr),
+    )
+    .await;
 
     let remote = match connect_result {
         Ok(Ok(conn)) => conn,
         Ok(Err(e)) => {
             warn!("proxy connect to {} failed: {}", target, e);
-            session
-                .handshake_failure(stream_id, &e.to_string())
-                .await?;
+            session.handshake_failure(stream_id, &e.to_string()).await?;
             return Err(Error::Io(std::io::Error::other(e.to_string())));
         }
         Err(_elapsed) => {

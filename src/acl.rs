@@ -1871,10 +1871,7 @@ acl:
                 direct: None,
             }],
             acl: AclRules {
-                inline: vec![
-                    "warp(example.com)".to_string(),
-                    "direct(all)".to_string(),
-                ],
+                inline: vec!["warp(example.com)".to_string(), "direct(all)".to_string()],
             },
         };
 
