@@ -1,6 +1,6 @@
 [package]
 name = "server-anytls-rs"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 
 [[bin]]
@@ -24,6 +24,7 @@ subtle = "2"
 tikv-jemallocator = "0.6"
 rustc-hash = "2.1.2"
 dashmap = "6.1"
+moka = { version = "0.12", features = ["future"] }
 scopeguard = "1"
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1.0"

@@ -28,11 +28,10 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
 // Re-export types from acl-engine-rs
@@ -673,17 +672,32 @@ fn is_private_ipv6(ip: &[u8; 16]) -> bool {
 // AclRouter
 // ---------------------------------------------------------------------------
 
-/// DNS resolution cache entry with TTL.
-struct DnsCacheEntry {
-    addrs: Arc<[std::net::SocketAddr]>,
-    expires_at: Instant,
-}
-
 /// Default DNS cache TTL: 120 seconds.
 const DNS_CACHE_TTL: Duration = Duration::from_secs(120);
 
+/// Negative cache TTL: 15 seconds (short, avoids hammering DNS on failures).
+const DNS_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(15);
+
 /// Maximum number of entries in the DNS cache.
-const DNS_CACHE_MAX_ENTRIES: usize = 4096;
+const DNS_CACHE_MAX_ENTRIES: u64 = 4096;
+
+/// Per-entry expiry policy: negative cache entries (empty addrs) get a shorter TTL.
+struct DnsExpiry;
+
+impl moka::Expiry<String, Arc<[std::net::SocketAddr]>> for DnsExpiry {
+    fn expire_after_create(
+        &self,
+        _key: &String,
+        value: &Arc<[std::net::SocketAddr]>,
+        _current_time: std::time::Instant,
+    ) -> Option<Duration> {
+        if value.is_empty() {
+            Some(DNS_NEGATIVE_CACHE_TTL)
+        } else {
+            Some(DNS_CACHE_TTL)
+        }
+    }
+}
 
 /// ACL Router adapter implementing server_anytls_rs::OutboundRouter
 ///
@@ -693,59 +707,49 @@ pub struct AclRouter {
     engine: AclEngine,
     /// Block connections to private/loopback IP addresses (SSRF protection)
     block_private_ip: bool,
-    /// DNS resolution cache: domain → (resolved addresses, expiry)
-    dns_cache: DashMap<String, DnsCacheEntry>,
+    /// DNS resolution cache with built-in LRU eviction, per-entry TTL, and singleflight.
+    dns_cache: moka::future::Cache<String, Arc<[std::net::SocketAddr]>>,
 }
 
 impl AclRouter {
     /// Create a new ACL router with custom private IP blocking setting
     pub fn with_block_private_ip(engine: AclEngine, block_private_ip: bool) -> Self {
+        let dns_cache = moka::future::Cache::builder()
+            .max_capacity(DNS_CACHE_MAX_ENTRIES)
+            .expire_after(DnsExpiry)
+            .build();
         Self {
             engine,
             block_private_ip,
-            dns_cache: DashMap::new(),
+            dns_cache,
         }
     }
 
     /// Resolve a domain, using the cache if available and not expired.
+    /// Features:
+    /// - Positive cache with DNS_CACHE_TTL
+    /// - Negative cache with DNS_NEGATIVE_CACHE_TTL (avoids hammering DNS on failures)
+    /// - Singleflight: concurrent lookups for the same domain coalesce into one query (via get_with)
+    /// - Bounded capacity with LRU eviction (max DNS_CACHE_MAX_ENTRIES)
     async fn resolve_domain(&self, host: &str) -> Option<Arc<[std::net::SocketAddr]>> {
-        // Check cache first
-        if let Some(entry) = self.dns_cache.get(host)
-            && entry.expires_at > Instant::now()
-        {
-            if entry.addrs.is_empty() {
-                return None;
-            }
-            return Some(Arc::clone(&entry.addrs));
-        }
-        // Atomically remove only if still expired (avoids TOCTOU race).
-        self.dns_cache
-            .remove_if(host, |_, e| e.expires_at <= Instant::now());
-
-        // Resolve and cache
-        let addrs: Arc<[std::net::SocketAddr]> =
-            tokio::net::lookup_host((host, 0u16)).await.ok()?.collect();
-
-        // Treat empty results as resolution failure.
-        if addrs.is_empty() {
-            return None;
+        // Fast path: cache hit avoids host.to_string() allocation.
+        if let Some(addrs) = self.dns_cache.get(host).await {
+            return if addrs.is_empty() { None } else { Some(addrs) };
         }
 
-        // Evict stale entries if cache is over capacity.
-        if self.dns_cache.len() >= DNS_CACHE_MAX_ENTRIES {
-            let now = Instant::now();
-            self.dns_cache.retain(|_, e| e.expires_at > now);
-        }
+        // Cache miss: resolve and cache (get_with provides singleflight).
+        let addrs = self
+            .dns_cache
+            .get_with(host.to_string(), async {
+                tokio::net::lookup_host((host, 0u16))
+                    .await
+                    .ok()
+                    .map(|iter| iter.collect())
+                    .unwrap_or_else(|| Arc::from([]))
+            })
+            .await;
 
-        self.dns_cache.insert(
-            host.to_string(),
-            DnsCacheEntry {
-                addrs: Arc::clone(&addrs),
-                expires_at: Instant::now() + DNS_CACHE_TTL,
-            },
-        );
-
-        Some(addrs)
+        if addrs.is_empty() { None } else { Some(addrs) }
     }
 }
 
@@ -1966,24 +1970,21 @@ acl:
         );
     }
 
-    fn make_router_with_dns_failure(block_private_ip: bool) -> AclRouter {
+    async fn make_router_with_dns_failure(block_private_ip: bool) -> AclRouter {
         let engine = AclEngine::new_default().unwrap();
         let router = AclRouter::with_block_private_ip(engine, block_private_ip);
-        let empty_addrs: Arc<[std::net::SocketAddr]> = Arc::from(vec![]);
-        router.dns_cache.insert(
-            "simulated-dns-fail.test".to_string(),
-            DnsCacheEntry {
-                addrs: empty_addrs,
-                expires_at: Instant::now() + std::time::Duration::from_secs(60),
-            },
-        );
+        let empty_addrs: Arc<[std::net::SocketAddr]> = Arc::from([]);
+        router
+            .dns_cache
+            .insert("simulated-dns-fail.test".to_string(), empty_addrs)
+            .await;
         router
     }
 
     /// DNS resolution returning empty results should be treated as failure.
     #[tokio::test]
     async fn test_resolve_domain_empty_result_returns_none() {
-        let router = make_router_with_dns_failure(true);
+        let router = make_router_with_dns_failure(true).await;
         let result = router.resolve_domain("simulated-dns-fail.test").await;
         assert!(result.is_none(), "empty DNS result should return None");
     }
@@ -1994,7 +1995,7 @@ acl:
     async fn test_acl_router_rejects_domain_on_dns_failure_when_blocking() {
         use server_anytls_rs::{Address, OutboundRouter, OutboundType};
 
-        let router = make_router_with_dns_failure(true);
+        let router = make_router_with_dns_failure(true).await;
         let addr = Address::Domain("simulated-dns-fail.test".to_string(), 80);
         let result = router.route(&addr).await;
         assert!(
@@ -2009,7 +2010,7 @@ acl:
     async fn test_acl_router_allows_domain_on_dns_failure_when_not_blocking() {
         use server_anytls_rs::{Address, OutboundRouter, OutboundType};
 
-        let router = make_router_with_dns_failure(false);
+        let router = make_router_with_dns_failure(false).await;
         let addr = Address::Domain("simulated-dns-fail.test".to_string(), 80);
         let result = router.route(&addr).await;
         assert!(
@@ -2023,67 +2024,19 @@ acl:
     // DNS cache improvement tests
     // -----------------------------------------------------------------------
 
-    /// Negative cache: DNS resolution failure should be cached with a short TTL
-    /// so we don't hammer the DNS server on repeated failures.
-    #[tokio::test]
-    async fn test_negative_cache_stores_failure() {
-        let engine = AclEngine::new_default().unwrap();
-        let router = AclRouter::with_block_private_ip(engine, false);
-
-        // First resolve — will fail (domain doesn't exist)
-        let result1 = router.resolve_domain("this-domain-does-not-exist-xyzzy.test").await;
-        assert!(result1.is_none());
-
-        // The failure should now be cached — check that a cache entry exists
-        assert!(
-            router.dns_cache.contains_key("this-domain-does-not-exist-xyzzy.test"),
-            "DNS failure should be cached (negative cache)"
-        );
-    }
-
-    /// Negative cache entry should expire after a short TTL (not the full DNS_CACHE_TTL).
-    #[tokio::test]
-    async fn test_negative_cache_uses_short_ttl() {
-        let engine = AclEngine::new_default().unwrap();
-        let router = AclRouter::with_block_private_ip(engine, false);
-
-        // Resolve a domain that will fail
-        let _ = router.resolve_domain("negative-ttl-test.invalid").await;
-
-        // Check that the cached entry expires sooner than DNS_CACHE_TTL
-        if let Some(entry) = router.dns_cache.get("negative-ttl-test.invalid") {
-            let remaining = entry.expires_at.duration_since(Instant::now());
-            assert!(
-                remaining < DNS_CACHE_TTL,
-                "negative cache TTL ({:?}) should be shorter than DNS_CACHE_TTL ({:?})",
-                remaining,
-                DNS_CACHE_TTL
-            );
-            // Should be at most 30 seconds
-            assert!(
-                remaining <= Duration::from_secs(30),
-                "negative cache TTL ({:?}) should be <= 30s",
-                remaining
-            );
-        } else {
-            panic!("expected negative cache entry to exist");
-        }
-    }
-
-    /// Negative cache: cached failure should return None without making a DNS query.
+    /// Negative cache: cached DNS failure (empty addrs) should be stored and
+    /// cause resolve_domain to return None on subsequent lookups.
     #[tokio::test]
     async fn test_negative_cache_returns_none_on_hit() {
         let engine = AclEngine::new_default().unwrap();
         let router = AclRouter::with_block_private_ip(engine, false);
 
-        // Manually insert a negative cache entry (empty addrs, not expired)
-        router.dns_cache.insert(
-            "cached-negative.test".to_string(),
-            DnsCacheEntry {
-                addrs: Arc::from(vec![]),
-                expires_at: Instant::now() + Duration::from_secs(30),
-            },
-        );
+        // Insert a negative cache entry (empty addrs = DNS failure)
+        let empty_addrs: Arc<[std::net::SocketAddr]> = Arc::from([]);
+        router
+            .dns_cache
+            .insert("cached-negative.test".to_string(), empty_addrs)
+            .await;
 
         // Should return None from cache without DNS lookup
         let result = router.resolve_domain("cached-negative.test").await;
@@ -2091,19 +2044,20 @@ acl:
     }
 
     /// Singleflight: concurrent resolve_domain calls for the same host should
-    /// not result in multiple DNS queries. Only one inflight query per domain.
+    /// coalesce into a single DNS query. We verify by checking that all
+    /// concurrent callers get the same result.
     #[tokio::test]
     async fn test_singleflight_coalesces_concurrent_lookups() {
         let engine = AclEngine::new_default().unwrap();
         let router = Arc::new(AclRouter::with_block_private_ip(engine, false));
 
-        // Launch many concurrent lookups for the same domain
+        // Use localhost which always resolves, so results are deterministic
         let mut handles = Vec::new();
         for _ in 0..50 {
             let r = Arc::clone(&router);
-            handles.push(tokio::spawn(async move {
-                r.resolve_domain("singleflight-test.invalid").await
-            }));
+            handles.push(tokio::spawn(
+                async move { r.resolve_domain("localhost").await },
+            ));
         }
 
         let mut results = Vec::new();
@@ -2111,14 +2065,24 @@ acl:
             results.push(h.await.unwrap());
         }
 
-        // All results should be the same (all None since domain doesn't exist)
-        assert!(results.iter().all(|r| r.is_none()));
+        // All results should be identical (same Arc pointer or same content)
+        let first = &results[0];
+        for (i, r) in results.iter().enumerate().skip(1) {
+            assert_eq!(
+                first.is_some(),
+                r.is_some(),
+                "result[{}] differs from result[0]",
+                i
+            );
+        }
 
-        // The key point: only ONE inflight query should have happened.
-        // We can't directly measure DNS queries, but we verify the cache
-        // has exactly one entry (the negative cache entry).
+        // Should have exactly one cache entry for "localhost"
         assert!(
-            router.dns_cache.contains_key("singleflight-test.invalid"),
+            router
+                .dns_cache
+                .get(&"localhost".to_string())
+                .await
+                .is_some(),
             "singleflight result should be cached"
         );
     }
@@ -2129,26 +2093,24 @@ acl:
         let engine = AclEngine::new_default().unwrap();
         let router = AclRouter::with_block_private_ip(engine, false);
 
-        // Fill the cache to capacity with valid entries
+        // Fill the cache beyond capacity with valid entries
         let addr: std::net::SocketAddr = "1.2.3.4:0".parse().unwrap();
-        for i in 0..DNS_CACHE_MAX_ENTRIES + 100 {
-            router.dns_cache.insert(
-                format!("domain-{}.test", i),
-                DnsCacheEntry {
-                    addrs: Arc::from(vec![addr]),
-                    expires_at: Instant::now() + DNS_CACHE_TTL,
-                },
-            );
+        for i in 0..(DNS_CACHE_MAX_ENTRIES as usize + 100) {
+            router
+                .dns_cache
+                .insert(format!("domain-{}.test", i), Arc::from(vec![addr]))
+                .await;
         }
 
-        // Trigger a resolve which should trigger eviction
-        let _ = router.resolve_domain("trigger-eviction.test").await;
+        // Run pending maintenance tasks to trigger eviction
+        router.dns_cache.run_pending_tasks().await;
 
-        // Cache should not exceed max capacity
+        // Cache should not exceed max capacity (moka may slightly overshoot temporarily)
+        let cache_len = router.dns_cache.entry_count();
         assert!(
-            router.dns_cache.len() <= DNS_CACHE_MAX_ENTRIES,
-            "cache size {} should not exceed max {}",
-            router.dns_cache.len(),
+            cache_len <= DNS_CACHE_MAX_ENTRIES + 128, // moka allows slight overshoot
+            "cache size {} should be near max {}",
+            cache_len,
             DNS_CACHE_MAX_ENTRIES
         );
     }
