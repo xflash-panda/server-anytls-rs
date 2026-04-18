@@ -78,7 +78,14 @@ impl Server {
                     break;
                 }
                 result = listener.accept() => {
-                    let (tcp_stream, peer_addr) = result?;
+                    let (tcp_stream, peer_addr) = match result {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!("accept error: {e}");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    };
                     let _ = tcp_stream.set_nodelay(true);
                     let permit = self.semaphore.clone().acquire_owned().await;
                     let Ok(permit) = permit else { continue; };
