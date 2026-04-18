@@ -987,8 +987,7 @@ mod tests {
         })
         .await;
 
-        let total =
-            read_result.expect("read timed out — stream likely killed by channel pressure");
+        let total = read_result.expect("read timed out — stream likely killed by channel pressure");
         assert_eq!(
             total, total_expected,
             "stream lost data under extreme pressure: expected {} got {}",
