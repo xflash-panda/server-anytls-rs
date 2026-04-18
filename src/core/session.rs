@@ -185,35 +185,17 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                             Err(mpsc::error::TrySendError::Closed(_)) => {
                                 streams.remove(&header.stream_id);
                             }
-                            Err(mpsc::error::TrySendError::Full(data)) => {
-                                // Channel is temporarily full. Wait for the
-                                // consumer to catch up with a timeout, preserving
-                                // frame ordering. With capacity 1024 this path is
-                                // rarely hit — only when the consumer is severely
-                                // behind (e.g. slow downstream connection).
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                // Channel full (capacity 1024) — consumer is
+                                // severely behind. Drop this stream immediately
+                                // to avoid blocking recv_loop (which would stall
+                                // ALL streams on this connection).
                                 let stream_id = header.stream_id;
-                                match tokio::time::timeout(
-                                    std::time::Duration::from_secs(5),
-                                    tx.send(data),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(())) => {}
-                                    Ok(Err(_)) => {
-                                        debug!(
-                                            stream_id,
-                                            "stream closed while waiting for channel space"
-                                        );
-                                        streams.remove(&stream_id);
-                                    }
-                                    Err(_) => {
-                                        warn!(
-                                            stream_id,
-                                            "stream channel full for 5s, closing stream"
-                                        );
-                                        streams.remove(&stream_id);
-                                    }
-                                }
+                                warn!(
+                                    stream_id,
+                                    "stream channel full, closing stream"
+                                );
+                                streams.remove(&stream_id);
                             }
                         }
                     }
@@ -840,162 +822,6 @@ mod tests {
         assert!(result.is_ok(), "session did not terminate after going idle");
 
         drop(client_io);
-    }
-
-    /// When a stream's channel is temporarily full, the stream must survive
-    /// and continue to deliver data once the consumer catches up.
-    /// This test floods frames faster than the consumer reads, ensuring no
-    /// data is lost and the stream is not prematurely closed.
-    #[tokio::test]
-    async fn test_stream_survives_channel_pressure() {
-        let (mut client_io, server_io) = duplex(4 * 1024 * 1024);
-        let padding = test_padding();
-        let session = Arc::new(Session::new_server(
-            server_io,
-            padding,
-            SessionConfig::default(),
-        ));
-        let settings_data = format!("v=2\npadding-md5={}", session.padding_md5());
-        write_frame(
-            &mut client_io,
-            Command::Settings,
-            0,
-            settings_data.as_bytes(),
-        )
-        .await;
-        write_frame(&mut client_io, Command::Syn, 1, &[]).await;
-
-        let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
-        let sess = session.clone();
-        let handle = tokio::spawn(async move {
-            sess.recv_loop(new_stream_tx, None, CancellationToken::new())
-                .await
-        });
-
-        let mut stream =
-            tokio::time::timeout(std::time::Duration::from_secs(1), new_stream_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-
-        // Send more frames than the channel capacity (currently 128) to trigger
-        // backpressure. The stream must NOT be killed.
-        let frame_count = 200;
-        let frame_data = vec![0xAB_u8; 1024];
-        let total_expected = frame_count * 1024;
-
-        // Burst-send ALL frames first, WITHOUT reading from the stream.
-        // This ensures recv_loop processes them and the channel fills up.
-        for _ in 0..frame_count {
-            write_frame(&mut client_io, Command::Psh, 1, &frame_data).await;
-        }
-        write_frame(&mut client_io, Command::Fin, 1, &[]).await;
-
-        // Give recv_loop time to process all frames and hit channel pressure.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        // NOW start consuming. The stream should still be alive and deliver
-        // all data despite the channel having been full.
-        let mut total = 0;
-        let mut buf = [0u8; 4096];
-        let read_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let n = stream.read(&mut buf).await.unwrap();
-                if n == 0 {
-                    break;
-                }
-                total += n;
-            }
-            total
-        })
-        .await;
-
-        let total = read_result.expect("read timed out — stream likely killed by channel pressure");
-        assert_eq!(
-            total, total_expected,
-            "stream lost data under channel pressure: expected {} got {}",
-            total_expected, total
-        );
-
-        drop(client_io);
-        let _ = handle.await;
-    }
-
-    /// Even under extreme pressure (far exceeding channel capacity), the
-    /// stream must survive by using async send fallback with a timeout.
-    /// Only truly stuck streams (consumer completely dead) should be closed.
-    #[tokio::test]
-    async fn test_stream_survives_extreme_channel_pressure() {
-        let (mut client_io, server_io) = duplex(16 * 1024 * 1024);
-        let padding = test_padding();
-        let session = Arc::new(Session::new_server(
-            server_io,
-            padding,
-            SessionConfig::default(),
-        ));
-        let settings_data = format!("v=2\npadding-md5={}", session.padding_md5());
-        write_frame(
-            &mut client_io,
-            Command::Settings,
-            0,
-            settings_data.as_bytes(),
-        )
-        .await;
-        write_frame(&mut client_io, Command::Syn, 1, &[]).await;
-
-        let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
-        let sess = session.clone();
-        let handle = tokio::spawn(async move {
-            sess.recv_loop(new_stream_tx, None, CancellationToken::new())
-                .await
-        });
-
-        let mut stream =
-            tokio::time::timeout(std::time::Duration::from_secs(1), new_stream_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-
-        // Send 1200 frames — exceeds channel capacity of 1024.
-        // We send them all into the duplex pipe (16MB, big enough) BEFORE
-        // reading, so recv_loop processes them and try_send fills the channel.
-        let frame_count = 1200;
-        let frame_data = vec![0xAB_u8; 512];
-        let total_expected = frame_count * 512;
-
-        // Write all frames synchronously — duplex is large enough to hold them.
-        for _ in 0..frame_count {
-            write_frame(&mut client_io, Command::Psh, 1, &frame_data).await;
-        }
-        write_frame(&mut client_io, Command::Fin, 1, &[]).await;
-
-        // Give recv_loop time to process all frames and hit channel pressure.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        // NOW start consuming. The stream should still be alive.
-        let mut total = 0;
-        let mut buf = [0u8; 4096];
-        let read_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let n = stream.read(&mut buf).await.unwrap();
-                if n == 0 {
-                    break;
-                }
-                total += n;
-            }
-            total
-        })
-        .await;
-
-        let total = read_result.expect("read timed out — stream likely killed by channel pressure");
-        assert_eq!(
-            total, total_expected,
-            "stream lost data under extreme pressure: expected {} got {}",
-            total_expected, total
-        );
-
-        drop(client_io);
-        let _ = handle.await;
     }
 
     /// Issue #2: write_cmd channel (capacity 256) shared by ALL streams.
