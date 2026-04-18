@@ -191,10 +191,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                                 // to avoid blocking recv_loop (which would stall
                                 // ALL streams on this connection).
                                 let stream_id = header.stream_id;
-                                warn!(
-                                    stream_id,
-                                    "stream channel full, closing stream"
-                                );
+                                warn!(stream_id, "stream channel full, closing stream");
                                 streams.remove(&stream_id);
                             }
                         }
