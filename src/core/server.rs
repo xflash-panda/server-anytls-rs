@@ -188,8 +188,10 @@ impl ServerBuilder {
         self
     }
 
-    pub fn build(self) -> Server {
-        let authenticator = self.authenticator.expect("authenticator is required");
+    pub fn build(self) -> anyhow::Result<Server> {
+        let authenticator = self
+            .authenticator
+            .ok_or_else(|| anyhow::anyhow!("authenticator is required"))?;
 
         let stats: Arc<dyn StatsCollector> =
             self.stats.unwrap_or_else(|| Arc::new(NoopStatsCollector));
@@ -199,7 +201,8 @@ impl ServerBuilder {
             .unwrap_or_else(|| Arc::new(crate::core::hooks::DirectRouter));
 
         let scheme = self.padding_scheme.as_deref().unwrap_or(DEFAULT_SCHEME);
-        let padding = PaddingFactory::new(scheme).expect("invalid padding scheme");
+        let padding = PaddingFactory::new(scheme)
+            .map_err(|e| anyhow::anyhow!("invalid padding scheme: {e}"))?;
 
         let config = ServerConfig {
             max_connections: self.max_connections,
@@ -223,7 +226,7 @@ impl ServerBuilder {
 
         let connection_manager = self.connection_manager.unwrap_or_default();
 
-        Server {
+        Ok(Server {
             authenticator,
             stats,
             router,
@@ -232,7 +235,7 @@ impl ServerBuilder {
             config,
             semaphore,
             connection_manager,
-        }
+        })
     }
 }
 
@@ -249,7 +252,8 @@ mod tests {
     fn test_server_builder_defaults() {
         let server = Server::builder()
             .authenticator(Arc::new(SinglePasswordAuth::new("test")))
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(server.config.max_connections, 10000);
         assert_eq!(server.config.max_streams_per_session, 256);
         assert_eq!(server.config.handshake_timeout, Duration::from_secs(10));
@@ -262,7 +266,8 @@ mod tests {
             .max_connections(500)
             .max_streams_per_session(64)
             .tcp_connect_timeout(std::time::Duration::from_secs(10))
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(server.config.max_connections, 500);
         assert_eq!(server.config.max_streams_per_session, 64);
         assert_eq!(
@@ -274,7 +279,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "authenticator is required")]
     fn test_server_builder_missing_auth() {
-        Server::builder().build();
+        Server::builder().build().unwrap();
     }
 
     #[test]
@@ -283,7 +288,8 @@ mod tests {
             .authenticator(Arc::new(SinglePasswordAuth::new("pw")))
             .stats(Arc::new(NoopStatsCollector))
             .router(Arc::new(DirectRouter))
-            .build();
+            .build()
+            .unwrap();
         let _ = server;
     }
 
@@ -292,7 +298,8 @@ mod tests {
         let server = Server::builder()
             .authenticator(Arc::new(SinglePasswordAuth::new("test")))
             .max_streams_per_session(128)
-            .build();
+            .build()
+            .unwrap();
         let sc = server.session_config();
         assert_eq!(sc.max_streams, 128);
     }

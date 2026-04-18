@@ -6,7 +6,7 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::core::hooks::{Address, OutboundType, UserId};
 use crate::core::server::Server;
@@ -127,11 +127,9 @@ pub(crate) async fn handle_stream<T: AsyncRead + AsyncWrite + Unpin + Send + 'st
     let (target, consumed) = parse_socks_address(&buf[..n])?;
 
     if is_udp_over_tcp(&target) {
-        info!(
-            "UDP-over-TCP requested for {}, not implemented — closing stream",
-            target
-        );
-        return Ok(());
+        let trailing = buf[consumed..n].to_vec();
+        return crate::udp_relay::handle_udp_over_tcp(server, session, stream, trailing, user_id)
+            .await;
     }
 
     let trailing = buf[consumed..n].to_vec();
@@ -451,7 +449,8 @@ mod tests {
                 .authenticator(Arc::new(SinglePasswordAuth::new("test")))
                 .stats(recording.clone() as Arc<dyn StatsCollector>)
                 .router(Arc::new(DirectRouter))
-                .build(),
+                .build()
+                .unwrap(),
         );
 
         let (_client_io, server_io) = tokio::io::duplex(65536);
@@ -544,7 +543,8 @@ mod tests {
                 .authenticator(Arc::new(SinglePasswordAuth::new("test")))
                 .stats(recording.clone() as Arc<dyn StatsCollector>)
                 .router(Arc::new(DirectRouter))
-                .build(),
+                .build()
+                .unwrap(),
         );
 
         // Session over duplex

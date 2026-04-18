@@ -156,7 +156,8 @@ async fn test_full_e2e_echo() {
             .authenticator(Arc::new(SinglePasswordAuth::new(PASSWORD)))
             .router(Arc::new(DirectRouter))
             .tls_config(tls_server_config)
-            .build(),
+            .build()
+            .unwrap(),
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -262,7 +263,8 @@ async fn test_auth_failure() {
             .authenticator(Arc::new(SinglePasswordAuth::new(PASSWORD)))
             .router(Arc::new(DirectRouter))
             .tls_config(tls_server_config)
-            .build(),
+            .build()
+            .unwrap(),
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -316,7 +318,8 @@ async fn test_heartbeat() {
             .authenticator(Arc::new(SinglePasswordAuth::new(PASSWORD)))
             .router(Arc::new(DirectRouter))
             .tls_config(tls_server_config)
-            .build(),
+            .build()
+            .unwrap(),
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -351,10 +354,10 @@ async fn test_heartbeat() {
 
     // Drain ServerSettings
     for _ in 0..3 {
-        if let Some((hdr, _)) = read_frame(&mut tls).await {
-            if hdr.command == Command::ServerSettings {
-                break;
-            }
+        if let Some((hdr, _)) = read_frame(&mut tls).await
+            && hdr.command == Command::ServerSettings
+        {
+            break;
         }
     }
 
@@ -390,7 +393,8 @@ async fn test_tls_session_resumption() {
             .authenticator(Arc::new(SinglePasswordAuth::new(PASSWORD)))
             .router(Arc::new(DirectRouter))
             .tls_config(tls_server_config)
-            .build(),
+            .build()
+            .unwrap(),
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -436,10 +440,10 @@ async fn test_tls_session_resumption() {
 
         // Read ServerSettings (this also processes any queued NewSessionTicket)
         for _ in 0..5 {
-            if let Some((hdr, _)) = read_frame(&mut tls).await {
-                if hdr.command == Command::ServerSettings {
-                    break;
-                }
+            if let Some((hdr, _)) = read_frame(&mut tls).await
+                && hdr.command == Command::ServerSettings
+            {
+                break;
             }
         }
     }

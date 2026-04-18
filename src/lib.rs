@@ -5,6 +5,7 @@ pub mod core;
 pub mod error;
 pub mod handler;
 pub mod outbound;
+pub mod udp_relay;
 
 // Convenience re-exports
 pub use core::connection::ConnectionManager;
