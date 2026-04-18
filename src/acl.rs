@@ -28,9 +28,11 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
 // Re-export types from acl-engine-rs
@@ -671,6 +673,18 @@ fn is_private_ipv6(ip: &[u8; 16]) -> bool {
 // AclRouter
 // ---------------------------------------------------------------------------
 
+/// DNS resolution cache entry with TTL.
+struct DnsCacheEntry {
+    addrs: Arc<[std::net::SocketAddr]>,
+    expires_at: Instant,
+}
+
+/// Default DNS cache TTL: 120 seconds.
+const DNS_CACHE_TTL: Duration = Duration::from_secs(120);
+
+/// Maximum number of entries in the DNS cache.
+const DNS_CACHE_MAX_ENTRIES: usize = 4096;
+
 /// ACL Router adapter implementing server_anytls_rs::OutboundRouter
 ///
 /// This adapter wraps the ACL engine and implements the OutboundRouter trait
@@ -679,6 +693,8 @@ pub struct AclRouter {
     engine: AclEngine,
     /// Block connections to private/loopback IP addresses (SSRF protection)
     block_private_ip: bool,
+    /// DNS resolution cache: domain → (resolved addresses, expiry)
+    dns_cache: DashMap<String, DnsCacheEntry>,
 }
 
 impl AclRouter {
@@ -687,7 +703,41 @@ impl AclRouter {
         Self {
             engine,
             block_private_ip,
+            dns_cache: DashMap::new(),
         }
+    }
+
+    /// Resolve a domain, using the cache if available and not expired.
+    async fn resolve_domain(&self, host: &str) -> Option<Arc<[std::net::SocketAddr]>> {
+        // Check cache first
+        if let Some(entry) = self.dns_cache.get(host)
+            && entry.expires_at > Instant::now()
+        {
+            return Some(Arc::clone(&entry.addrs));
+        }
+        // Atomically remove only if still expired (avoids TOCTOU race).
+        self.dns_cache
+            .remove_if(host, |_, e| e.expires_at <= Instant::now());
+
+        // Resolve and cache
+        let addrs: Arc<[std::net::SocketAddr]> =
+            tokio::net::lookup_host((host, 0u16)).await.ok()?.collect();
+
+        // Evict stale entries if cache is over capacity.
+        if self.dns_cache.len() >= DNS_CACHE_MAX_ENTRIES {
+            let now = Instant::now();
+            self.dns_cache.retain(|_, e| e.expires_at > now);
+        }
+
+        self.dns_cache.insert(
+            host.to_string(),
+            DnsCacheEntry {
+                addrs: Arc::clone(&addrs),
+                expires_at: Instant::now() + DNS_CACHE_TTL,
+            },
+        );
+
+        Some(addrs)
     }
 }
 
@@ -696,21 +746,24 @@ impl server_anytls_rs::OutboundRouter for AclRouter {
     async fn route(&self, addr: &server_anytls_rs::Address) -> server_anytls_rs::OutboundType {
         use server_anytls_rs::{Address, OutboundType};
 
-        // Check for private IP if blocking is enabled
-        if self.block_private_ip {
-            match addr {
-                Address::IPv4(ip, _) if is_private_ipv4(ip) => {
-                    log::debug!(target = %addr, "Blocked private IPv4 address");
-                    return OutboundType::Reject;
-                }
-                Address::IPv6(ip, _) if is_private_ipv6(ip) => {
-                    log::debug!(target = %addr, "Blocked private IPv6 address");
-                    return OutboundType::Reject;
-                }
-                Address::Domain(host, _) => {
-                    // Resolve domain to check if it points to a private IP
-                    if let Ok(addrs) = tokio::net::lookup_host(format!("{}:0", host)).await {
-                        for resolved in addrs {
+        // Resolved addresses from DNS lookup (reused to avoid duplicate resolution).
+        let mut resolved_addrs: Option<Arc<[std::net::SocketAddr]>> = None;
+
+        match addr {
+            Address::IPv4(ip, _) if self.block_private_ip && is_private_ipv4(ip) => {
+                log::debug!(target = %addr, "Blocked private IPv4 address");
+                return OutboundType::Reject;
+            }
+            Address::IPv6(ip, _) if self.block_private_ip && is_private_ipv6(ip) => {
+                log::debug!(target = %addr, "Blocked private IPv6 address");
+                return OutboundType::Reject;
+            }
+            Address::Domain(host, _) => {
+                // Resolve domain (cached) so connect_target() can reuse the result.
+                if let Some(addrs) = self.resolve_domain(host).await {
+                    // Check for private IP if blocking is enabled.
+                    if self.block_private_ip {
+                        for resolved in addrs.iter() {
                             match resolved.ip() {
                                 std::net::IpAddr::V4(ip) => {
                                     let octets = ip.octets();
@@ -729,9 +782,10 @@ impl server_anytls_rs::OutboundRouter for AclRouter {
                             }
                         }
                     }
+                    resolved_addrs = Some(addrs);
                 }
-                _ => {}
             }
+            _ => {}
         }
 
         // Extract host string for ACL matching
@@ -740,13 +794,17 @@ impl server_anytls_rs::OutboundRouter for AclRouter {
 
         match self.engine.match_host(&host, port, Protocol::TCP) {
             Some(handler) => match &*handler {
-                OutboundHandler::Direct(_) => OutboundType::Direct,
+                OutboundHandler::Direct(_) => OutboundType::Direct {
+                    resolved: resolved_addrs,
+                },
                 OutboundHandler::Socks5 { .. } | OutboundHandler::Http(_) => {
                     OutboundType::Proxy(handler)
                 }
                 OutboundHandler::Reject(_) => OutboundType::Reject,
             },
-            None => OutboundType::Direct,
+            None => OutboundType::Direct {
+                resolved: resolved_addrs,
+            },
         }
     }
 }
@@ -1698,7 +1756,7 @@ acl:
         // Test public IP should not be rejected
         let addr = Address::IPv4([8, 8, 8, 8], 80);
         let result = router.route(&addr).await;
-        assert!(matches!(result, OutboundType::Direct));
+        assert!(matches!(result, OutboundType::Direct { .. }));
     }
 
     #[tokio::test]
@@ -1729,7 +1787,7 @@ acl:
         // Private IP should be allowed when blocking is disabled
         let addr = Address::IPv4([127, 0, 0, 1], 80);
         let result = router.route(&addr).await;
-        assert!(matches!(result, OutboundType::Direct));
+        assert!(matches!(result, OutboundType::Direct { .. }));
     }
 
     // ---------------------------------------------------------------------------
@@ -1891,7 +1949,7 @@ acl:
         let addr = Address::Domain("other.com".to_string(), 80);
         let result = router.route(&addr).await;
         assert!(
-            matches!(result, OutboundType::Direct),
+            matches!(result, OutboundType::Direct { .. }),
             "expected Direct for unmatched domain, got {:?}",
             result
         );
