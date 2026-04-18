@@ -92,15 +92,7 @@ async fn read_uot_address<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Soc
             let domain = String::from_utf8(name)
                 .map_err(|_| Error::InvalidFrame("UoT FQDN not UTF-8".into()))?;
             let port = reader.read_u16().await?;
-            tokio::net::lookup_host(format!("{domain}:{port}"))
-                .await?
-                .next()
-                .ok_or_else(|| {
-                    Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("DNS resolution failed for {domain}"),
-                    ))
-                })
+            resolve_host(&domain, port).await
         }
         t => Err(Error::InvalidFrame(format!(
             "unknown UoT address type: 0x{t:02x}"
@@ -123,6 +115,20 @@ fn encode_uot_address(addr: &SocketAddr, buf: &mut Vec<u8>) {
     }
 }
 
+fn resolve_failed(name: &str) -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("DNS resolution failed for {name}"),
+    ))
+}
+
+async fn resolve_host(host: &str, port: u16) -> Result<SocketAddr> {
+    tokio::net::lookup_host(format!("{host}:{port}"))
+        .await?
+        .next()
+        .ok_or_else(|| resolve_failed(host))
+}
+
 async fn address_to_socket_addr(addr: &Address) -> Result<SocketAddr> {
     match addr {
         Address::IPv4(ip, port) => Ok(SocketAddr::V4(SocketAddrV4::new(
@@ -135,15 +141,7 @@ async fn address_to_socket_addr(addr: &Address) -> Result<SocketAddr> {
             0,
             0,
         ))),
-        Address::Domain(host, port) => tokio::net::lookup_host(format!("{host}:{port}"))
-            .await?
-            .next()
-            .ok_or_else(|| {
-                Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("DNS resolution failed for {host}"),
-                ))
-            }),
+        Address::Domain(host, port) => resolve_host(host, *port).await,
     }
 }
 
@@ -179,6 +177,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for PrefixedReader<R> {
             let amt = remaining.len().min(buf.remaining());
             buf.put_slice(&remaining[..amt]);
             this.prefix_pos += amt;
+            if this.prefix_pos >= this.prefix.len() {
+                this.prefix = Vec::new();
+            }
             return Poll::Ready(Ok(()));
         }
         Pin::new(&mut this.inner).poll_read(cx, buf)
@@ -223,18 +224,23 @@ pub(crate) async fn handle_udp_over_tcp<T: AsyncRead + AsyncWrite + Unpin + Send
         "UDP-over-TCP session starting"
     );
 
-    // Bind a UDP socket.
-    let udp = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
-
     // If connect mode, pre-resolve the destination and "connect" the socket
     // so we can use send/recv instead of send_to/recv_from.
     let connect_dest = if request.is_connect {
-        let dest = address_to_socket_addr(&request.destination).await?;
-        udp.connect(dest).await?;
-        Some(dest)
+        Some(address_to_socket_addr(&request.destination).await?)
     } else {
         None
     };
+
+    // Bind a UDP socket matching the destination address family.
+    let bind_addr = match connect_dest {
+        Some(SocketAddr::V6(_)) => "[::]:0",
+        _ => "0.0.0.0:0",
+    };
+    let udp = Arc::new(UdpSocket::bind(bind_addr).await?);
+    if let Some(dest) = connect_dest {
+        udp.connect(dest).await?;
+    }
 
     // Signal handshake success to the client.
     session.handshake_success(stream_id).await?;
@@ -246,16 +252,14 @@ pub(crate) async fn handle_udp_over_tcp<T: AsyncRead + AsyncWrite + Unpin + Send
     let upload_bytes = Arc::new(AtomicU64::new(0));
     let download_bytes = Arc::new(AtomicU64::new(0));
 
-    let is_connect = request.is_connect;
-
     // Client → UDP
     let udp_send = udp.clone();
     let up = upload_bytes.clone();
     let client_to_udp = async {
+        let mut payload = vec![0u8; 65536];
         loop {
-            let dest = if is_connect {
-                // In connect mode, no per-packet address; use pre-established dest.
-                connect_dest.unwrap()
+            let dest = if let Some(dest) = connect_dest {
+                dest
             } else {
                 read_uot_address(&mut reader).await?
             };
@@ -263,13 +267,15 @@ pub(crate) async fn handle_udp_over_tcp<T: AsyncRead + AsyncWrite + Unpin + Send
             if length == 0 {
                 continue;
             }
-            let mut payload = vec![0u8; length];
-            reader.read_exact(&mut payload).await?;
+            if payload.len() < length {
+                payload.resize(length, 0);
+            }
+            reader.read_exact(&mut payload[..length]).await?;
             up.fetch_add(length as u64, Ordering::Relaxed);
-            if is_connect {
-                udp_send.send(&payload).await?;
+            if connect_dest.is_some() {
+                udp_send.send(&payload[..length]).await?;
             } else {
-                udp_send.send_to(&payload, dest).await?;
+                udp_send.send_to(&payload[..length], dest).await?;
             }
         }
         #[allow(unreachable_code)]
@@ -282,9 +288,9 @@ pub(crate) async fn handle_udp_over_tcp<T: AsyncRead + AsyncWrite + Unpin + Send
         let mut recv_buf = vec![0u8; 65536];
         let mut frame_buf = Vec::with_capacity(65536 + 19 + 2);
         loop {
-            let (n, src_addr) = if is_connect {
+            let (n, src_addr) = if let Some(dest) = connect_dest {
                 let n = udp.recv(&mut recv_buf).await?;
-                (n, connect_dest.unwrap())
+                (n, dest)
             } else {
                 udp.recv_from(&mut recv_buf).await?
             };
@@ -292,13 +298,12 @@ pub(crate) async fn handle_udp_over_tcp<T: AsyncRead + AsyncWrite + Unpin + Send
 
             // Build UoT frame
             frame_buf.clear();
-            if !is_connect {
+            if connect_dest.is_none() {
                 encode_uot_address(&src_addr, &mut frame_buf);
             }
             frame_buf.extend_from_slice(&(n as u16).to_be_bytes());
             frame_buf.extend_from_slice(&recv_buf[..n]);
             write_half.write_all(&frame_buf).await?;
-            write_half.flush().await?;
         }
         #[allow(unreachable_code)]
         Ok::<(), Error>(())
