@@ -33,6 +33,10 @@ impl StatsCollector for AnyTlsStatsCollector {
     fn record_download(&self, user_id: UserId, bytes: u64) {
         self.0.record_download(user_id, bytes);
     }
+
+    fn record_request(&self, user_id: UserId) {
+        self.0.record_request(user_id);
+    }
 }
 
 /// Newtype bridging UserManager::authenticate() to core::hooks::Authenticator trait

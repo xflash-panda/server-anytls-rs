@@ -109,6 +109,7 @@ pub trait Authenticator: Send + Sync {
 pub trait StatsCollector: Send + Sync {
     fn record_upload(&self, user_id: UserId, bytes: u64);
     fn record_download(&self, user_id: UserId, bytes: u64);
+    fn record_request(&self, user_id: UserId);
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +161,7 @@ pub struct NoopStatsCollector;
 impl StatsCollector for NoopStatsCollector {
     fn record_upload(&self, _user_id: UserId, _bytes: u64) {}
     fn record_download(&self, _user_id: UserId, _bytes: u64) {}
+    fn record_request(&self, _user_id: UserId) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +204,7 @@ mod tests {
         let stats = NoopStatsCollector;
         stats.record_upload(0, 1024);
         stats.record_download(0, 2048);
+        stats.record_request(0);
     }
 
     #[tokio::test]
