@@ -1,6 +1,6 @@
 [package]
 name = "server-anytls-rs"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 
 [[bin]]
@@ -90,6 +90,18 @@ harness = false
 
 [[bench]]
 name = "lock_contention_bench"
+harness = false
+
+[[bench]]
+name = "settings_response_bench"
+harness = false
+
+[[bench]]
+name = "auth_padding_bench"
+harness = false
+
+[[bench]]
+name = "padding_clone_bench"
 harness = false
 
 [profile.release]

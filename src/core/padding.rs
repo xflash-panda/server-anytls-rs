@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use md5::{Digest, Md5};
 use rand::Rng;
@@ -21,12 +22,18 @@ pub struct PaddingRange {
     pub max: i32,
 }
 
-#[derive(Debug, Clone)]
-pub struct PaddingFactory {
+/// Inner data behind Arc — cloning PaddingFactory is just an Arc refcount bump.
+#[derive(Debug)]
+struct PaddingFactoryInner {
     stop: u32,
     ranges: HashMap<u32, Vec<PaddingRange>>,
     raw: String,
     md5: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PaddingFactory {
+    inner: Arc<PaddingFactoryInner>,
 }
 
 impl PaddingFactory {
@@ -102,19 +109,21 @@ impl PaddingFactory {
         };
 
         Ok(Self {
-            stop,
-            ranges,
-            raw: scheme.to_string(),
-            md5,
+            inner: Arc::new(PaddingFactoryInner {
+                stop,
+                ranges,
+                raw: scheme.to_string(),
+                md5,
+            }),
         })
     }
 
     pub fn generate_record_payload_sizes(&self, pkt: u32) -> Vec<i32> {
-        if pkt >= self.stop {
+        if pkt >= self.inner.stop {
             return Vec::new();
         }
 
-        let Some(entry) = self.ranges.get(&pkt) else {
+        let Some(entry) = self.inner.ranges.get(&pkt) else {
             return Vec::new();
         };
 
@@ -133,11 +142,11 @@ impl PaddingFactory {
     }
 
     pub fn md5_hex(&self) -> &str {
-        &self.md5
+        &self.inner.md5
     }
 
     pub fn raw_scheme(&self) -> &str {
-        &self.raw
+        &self.inner.raw
     }
 }
 
@@ -148,14 +157,17 @@ mod tests {
     #[test]
     fn test_parse_default_scheme() {
         let factory = PaddingFactory::new(DEFAULT_SCHEME).unwrap();
-        assert_eq!(factory.stop, 8);
+        // stop=8: packets 0..7 have ranges, packet 8 returns empty
+        assert!(!factory.generate_record_payload_sizes(7).is_empty());
+        assert!(factory.generate_record_payload_sizes(8).is_empty());
     }
 
     #[test]
     fn test_parse_stop_value() {
         let scheme = "stop=5\n0=100-200";
         let factory = PaddingFactory::new(scheme).unwrap();
-        assert_eq!(factory.stop, 5);
+        // stop=5: packet 5 and above return empty
+        assert!(factory.generate_record_payload_sizes(5).is_empty());
     }
 
     #[test]

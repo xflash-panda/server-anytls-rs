@@ -29,6 +29,9 @@ pub enum Error {
     #[error("handshake timeout")]
     HandshakeTimeout,
 
+    #[error("frame payload too large: {0} bytes (max 65535)")]
+    FrameTooLarge(usize),
+
     #[error("padding scheme parse error: {0}")]
     PaddingParse(String),
 }

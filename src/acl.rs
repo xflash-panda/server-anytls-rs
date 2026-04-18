@@ -713,6 +713,9 @@ impl AclRouter {
         if let Some(entry) = self.dns_cache.get(host)
             && entry.expires_at > Instant::now()
         {
+            if entry.addrs.is_empty() {
+                return None;
+            }
             return Some(Arc::clone(&entry.addrs));
         }
         // Atomically remove only if still expired (avoids TOCTOU race).
@@ -722,6 +725,11 @@ impl AclRouter {
         // Resolve and cache
         let addrs: Arc<[std::net::SocketAddr]> =
             tokio::net::lookup_host((host, 0u16)).await.ok()?.collect();
+
+        // Treat empty results as resolution failure.
+        if addrs.is_empty() {
+            return None;
+        }
 
         // Evict stale entries if cache is over capacity.
         if self.dns_cache.len() >= DNS_CACHE_MAX_ENTRIES {
@@ -783,6 +791,9 @@ impl server_anytls_rs::OutboundRouter for AclRouter {
                         }
                     }
                     resolved_addrs = Some(addrs);
+                } else if self.block_private_ip {
+                    log::debug!(target = %addr, "Blocked domain with unresolvable DNS (fail-closed)");
+                    return OutboundType::Reject;
                 }
             }
             _ => {}
@@ -1951,6 +1962,59 @@ acl:
         assert!(
             matches!(result, OutboundType::Direct { .. }),
             "expected Direct for unmatched domain, got {:?}",
+            result
+        );
+    }
+
+    fn make_router_with_dns_failure(block_private_ip: bool) -> AclRouter {
+        let engine = AclEngine::new_default().unwrap();
+        let router = AclRouter::with_block_private_ip(engine, block_private_ip);
+        let empty_addrs: Arc<[std::net::SocketAddr]> = Arc::from(vec![]);
+        router.dns_cache.insert(
+            "simulated-dns-fail.test".to_string(),
+            DnsCacheEntry {
+                addrs: empty_addrs,
+                expires_at: Instant::now() + std::time::Duration::from_secs(60),
+            },
+        );
+        router
+    }
+
+    /// DNS resolution returning empty results should be treated as failure.
+    #[tokio::test]
+    async fn test_resolve_domain_empty_result_returns_none() {
+        let router = make_router_with_dns_failure(true);
+        let result = router.resolve_domain("simulated-dns-fail.test").await;
+        assert!(result.is_none(), "empty DNS result should return None");
+    }
+
+    /// When block_private_ip is enabled and DNS resolution fails,
+    /// the router must reject (fail-closed) to prevent SSRF bypass.
+    #[tokio::test]
+    async fn test_acl_router_rejects_domain_on_dns_failure_when_blocking() {
+        use server_anytls_rs::{Address, OutboundRouter, OutboundType};
+
+        let router = make_router_with_dns_failure(true);
+        let addr = Address::Domain("simulated-dns-fail.test".to_string(), 80);
+        let result = router.route(&addr).await;
+        assert!(
+            matches!(result, OutboundType::Reject),
+            "expected Reject when DNS fails with block_private_ip=true, got {:?}",
+            result
+        );
+    }
+
+    /// When block_private_ip is disabled, DNS failure should NOT reject.
+    #[tokio::test]
+    async fn test_acl_router_allows_domain_on_dns_failure_when_not_blocking() {
+        use server_anytls_rs::{Address, OutboundRouter, OutboundType};
+
+        let router = make_router_with_dns_failure(false);
+        let addr = Address::Domain("simulated-dns-fail.test".to_string(), 80);
+        let result = router.route(&addr).await;
+        assert!(
+            matches!(result, OutboundType::Direct { .. }),
+            "expected Direct when DNS fails with block_private_ip=false, got {:?}",
             result
         );
     }
