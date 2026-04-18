@@ -44,10 +44,21 @@ impl Address {
 
 impl Address {
     pub fn host_string(&self) -> String {
+        self.host_str().into_owned()
+    }
+
+    /// Returns the host as a borrowed string when possible (Domain case),
+    /// avoiding allocation. For IP addresses, returns the formatted string
+    /// via Cow::Owned.
+    pub fn host_str(&self) -> std::borrow::Cow<'_, str> {
         match self {
-            Address::IPv4(ip, _) => format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]),
-            Address::IPv6(ip, _) => std::net::Ipv6Addr::from(*ip).to_string(),
-            Address::Domain(host, _) => host.clone(),
+            Address::IPv4(ip, _) => {
+                std::borrow::Cow::Owned(format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]))
+            }
+            Address::IPv6(ip, _) => {
+                std::borrow::Cow::Owned(std::net::Ipv6Addr::from(*ip).to_string())
+            }
+            Address::Domain(host, _) => std::borrow::Cow::Borrowed(host.as_str()),
         }
     }
 }

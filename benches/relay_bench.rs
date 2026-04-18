@@ -9,6 +9,7 @@ use server_anytls_rs::core::padding::{DEFAULT_SCHEME, PaddingFactory};
 use server_anytls_rs::core::session::{Session, SessionConfig};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 
 const TOTAL_BYTES: usize = 4 * 1024 * 1024; // 4MB of payload
 
@@ -53,8 +54,10 @@ fn bench_relay(c: &mut Criterion) {
 
                     let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
                     let sess = session.clone();
-                    let recv_handle =
-                        tokio::spawn(async move { sess.recv_loop(new_stream_tx, None).await });
+                    let recv_handle = tokio::spawn(async move {
+                        sess.recv_loop(new_stream_tx, None, CancellationToken::new())
+                            .await
+                    });
 
                     let mut stream = new_stream_rx.recv().await.unwrap();
 

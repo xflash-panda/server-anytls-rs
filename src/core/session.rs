@@ -295,30 +295,43 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             stream_id,
             length: data.len() as u16,
         };
-        // Coalesce header + payload into a single write to avoid separate TLS records.
-        let mut buf = Vec::with_capacity(HEADER_SIZE + data.len());
         let mut hdr_buf = [0u8; HEADER_SIZE];
         header.encode(&mut hdr_buf);
-        buf.extend_from_slice(&hdr_buf);
-        buf.extend_from_slice(data);
+
+        let total = HEADER_SIZE + data.len();
         let mut w = self.write_half.lock().await;
-        w.write_all(&buf).await?;
+
+        // Use stack buffer for small control frames (FIN, SynAck, HeartResponse, etc.)
+        // to avoid heap allocation. Most control frames are ≤ 128 bytes.
+        if total <= 128 {
+            let mut stack_buf = [0u8; 128];
+            stack_buf[..HEADER_SIZE].copy_from_slice(&hdr_buf);
+            stack_buf[HEADER_SIZE..total].copy_from_slice(data);
+            w.write_all(&stack_buf[..total]).await?;
+        } else {
+            let mut buf = Vec::with_capacity(total);
+            buf.extend_from_slice(&hdr_buf);
+            buf.extend_from_slice(data);
+            w.write_all(&buf).await?;
+        }
         // Flush immediately so control frames are not delayed in the buffer.
-        // Without this, frames can sit in BufWriter/TLS buffers until the next
-        // data write triggers a flush, adding latency to handshakes and heartbeats.
         w.flush().await?;
         Ok(())
     }
 
     /// Batch-write settings response frames (UpdatePaddingScheme and/or
-    /// ServerSettings) under a single lock acquisition and flush.
+    /// ServerSettings) in a single lock acquisition and flush.
     async fn write_settings_response(
         &self,
         send_padding: bool,
         send_server_settings: bool,
     ) -> Result<()> {
-        // Build all response frames into a single buffer to minimize TLS records.
-        let mut buf = Vec::new();
+        if !send_padding && !send_server_settings {
+            return Ok(());
+        }
+
+        let mut w = self.write_half.lock().await;
+
         if send_padding {
             let data = self.padding.raw_scheme().as_bytes();
             let header = FrameHeader {
@@ -328,9 +341,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             };
             let mut hdr_buf = [0u8; HEADER_SIZE];
             header.encode(&mut hdr_buf);
-            buf.extend_from_slice(&hdr_buf);
-            buf.extend_from_slice(data);
+            w.write_all(&hdr_buf).await?;
+            w.write_all(data).await?;
         }
+
         if send_server_settings {
             let header = FrameHeader {
                 command: Command::ServerSettings,
@@ -339,11 +353,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             };
             let mut hdr_buf = [0u8; HEADER_SIZE];
             header.encode(&mut hdr_buf);
-            buf.extend_from_slice(&hdr_buf);
-            buf.extend_from_slice(b"v=2");
+            let mut buf = [0u8; HEADER_SIZE + 3];
+            buf[..HEADER_SIZE].copy_from_slice(&hdr_buf);
+            buf[HEADER_SIZE..].copy_from_slice(b"v=2");
+            w.write_all(&buf).await?;
         }
-        let mut w = self.write_half.lock().await;
-        w.write_all(&buf).await?;
+
         w.flush().await?;
         Ok(())
     }

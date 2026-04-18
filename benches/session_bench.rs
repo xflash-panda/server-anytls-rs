@@ -4,6 +4,7 @@ use server_anytls_rs::core::padding::{DEFAULT_SCHEME, PaddingFactory};
 use server_anytls_rs::core::session::{Session, SessionConfig};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+use tokio_util::sync::CancellationToken;
 
 fn bench_session_throughput(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -21,7 +22,10 @@ fn bench_session_throughput(c: &mut Criterion) {
                 let settings = format!("v=2\npadding-md5={}", session.padding_md5());
                 write_frame(&mut client_io, Command::Settings, 0, settings.as_bytes()).await;
                 let sess = session.clone();
-                let handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx, None).await });
+                let handle = tokio::spawn(async move {
+                    sess.recv_loop(new_stream_tx, None, CancellationToken::new())
+                        .await
+                });
                 write_frame(&mut client_io, Command::Syn, 1, &[]).await;
                 let mut stream = new_stream_rx.recv().await.unwrap();
                 let data = vec![0xAB_u8; 1024];

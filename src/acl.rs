@@ -788,8 +788,8 @@ impl server_anytls_rs::OutboundRouter for AclRouter {
             _ => {}
         }
 
-        // Extract host string for ACL matching
-        let host = addr.host_string();
+        // Extract host string for ACL matching (Cow avoids allocation for Domain)
+        let host = addr.host_str();
         let port = addr.port();
 
         match self.engine.match_host(&host, port, Protocol::TCP) {

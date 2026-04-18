@@ -6,6 +6,7 @@ use server_anytls_rs::core::padding::{DEFAULT_SCHEME, PaddingFactory};
 use server_anytls_rs::core::session::{Session, SessionConfig};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 
 const FRAME_COUNT: usize = 500;
 const FRAME_SIZE: usize = 4096;
@@ -55,8 +56,10 @@ fn bench_write_throughput(c: &mut Criterion) {
 
                 let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
                 let sess = session.clone();
-                let recv_handle =
-                    tokio::spawn(async move { sess.recv_loop(new_stream_tx, None).await });
+                let recv_handle = tokio::spawn(async move {
+                    sess.recv_loop(new_stream_tx, None, CancellationToken::new())
+                        .await
+                });
 
                 let mut stream = new_stream_rx.recv().await.unwrap();
 
@@ -120,8 +123,10 @@ fn bench_read_throughput(c: &mut Criterion) {
 
                 let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
                 let sess = session.clone();
-                let recv_handle =
-                    tokio::spawn(async move { sess.recv_loop(new_stream_tx, None).await });
+                let recv_handle = tokio::spawn(async move {
+                    sess.recv_loop(new_stream_tx, None, CancellationToken::new())
+                        .await
+                });
 
                 let mut stream = new_stream_rx.recv().await.unwrap();
 
