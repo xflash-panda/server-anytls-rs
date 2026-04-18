@@ -140,6 +140,10 @@ pub(crate) async fn handle_stream<T: AsyncRead + AsyncWrite + Unpin + Send + 'st
         OutboundType::Direct => {
             proxy_tcp(server, session, stream, &target, trailing, user_id).await
         }
+        OutboundType::Proxy(handler) => {
+            proxy_tcp_via_handler(server, session, stream, &target, trailing, user_id, handler)
+                .await
+        }
         OutboundType::Reject => {
             warn!("rejecting connection to {}", target);
             let stream_id = stream.id();
@@ -149,10 +153,7 @@ pub(crate) async fn handle_stream<T: AsyncRead + AsyncWrite + Unpin + Send + 'st
     }
 }
 
-/// Connect to `target` and bidirectionally relay data between `stream` and the
-/// remote TCP connection.  `trailing` holds any bytes that were read from the
-/// stream beyond the SOCKS address (e.g. the start of the HTTP request or TLS
-/// ClientHello) and must be forwarded to the remote before bidirectional copy.
+/// Connect directly to `target` and relay data.
 async fn proxy_tcp<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     server: Arc<Server>,
     session: Arc<Session<T>>,
@@ -162,20 +163,19 @@ async fn proxy_tcp<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     user_id: UserId,
 ) -> Result<()> {
     let stream_id = stream.id();
-    let addr_str = target.to_socket_string();
 
     let connect_result =
         tokio::time::timeout(server.config.tcp_connect_timeout, connect_target(target)).await;
 
-    let mut remote = match connect_result {
+    let remote = match connect_result {
         Ok(Ok(tcp)) => tcp,
         Ok(Err(e)) => {
-            warn!("failed to connect to {}: {}", addr_str, e);
+            warn!("failed to connect to {}: {}", target, e);
             session.handshake_failure(stream_id, &e.to_string()).await?;
             return Err(Error::Io(e));
         }
         Err(_elapsed) => {
-            warn!("connect timeout to {}", addr_str);
+            warn!("connect timeout to {}", target);
             session
                 .handshake_failure(stream_id, "connect timeout")
                 .await?;
@@ -187,6 +187,68 @@ async fn proxy_tcp<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     };
 
     session.handshake_success(stream_id).await?;
+    relay_and_record(server, session, stream, remote, trailing, user_id).await
+}
+
+/// Connect via an ACL outbound handler (Socks5, Http, etc.) and relay data.
+async fn proxy_tcp_via_handler<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    server: Arc<Server>,
+    session: Arc<Session<T>>,
+    stream: Stream,
+    target: &Address,
+    trailing: Vec<u8>,
+    user_id: UserId,
+    handler: Arc<dyn acl_engine_rs::outbound::AsyncOutbound>,
+) -> Result<()> {
+    use acl_engine_rs::outbound::Addr;
+
+    let stream_id = stream.id();
+    let mut acl_addr = Addr::new(target.host_string(), target.port());
+
+    let connect_result =
+        tokio::time::timeout(server.config.tcp_connect_timeout, handler.dial_tcp(&mut acl_addr))
+            .await;
+
+    let remote = match connect_result {
+        Ok(Ok(conn)) => conn,
+        Ok(Err(e)) => {
+            warn!("proxy connect to {} failed: {}", target, e);
+            session
+                .handshake_failure(stream_id, &e.to_string())
+                .await?;
+            return Err(Error::Io(std::io::Error::other(e.to_string())));
+        }
+        Err(_elapsed) => {
+            warn!("proxy connect timeout to {}", target);
+            session
+                .handshake_failure(stream_id, "connect timeout")
+                .await?;
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "proxy connect timeout",
+            )));
+        }
+    };
+
+    session.handshake_success(stream_id).await?;
+    relay_and_record(server, session, stream, remote, trailing, user_id).await
+}
+
+/// Bidirectional relay between client stream and remote, with byte counting and
+/// traffic stats recording. Handles trailing data forwarding and FIN signaling.
+async fn relay_and_record<T, R>(
+    server: Arc<Server>,
+    session: Arc<Session<T>>,
+    stream: Stream,
+    mut remote: R,
+    trailing: Vec<u8>,
+    user_id: UserId,
+) -> Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    R: AsyncRead + AsyncWrite + Unpin,
+{
+    let stream_id = stream.id();
 
     // Forward any application data that was read alongside the SOCKS address.
     let trailing_len = trailing.len() as u64;

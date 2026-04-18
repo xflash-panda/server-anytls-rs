@@ -1,6 +1,8 @@
+use std::fmt;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
-use std::fmt;
 
 pub type UserId = i64;
 
@@ -39,6 +41,16 @@ impl Address {
     }
 }
 
+impl Address {
+    pub fn host_string(&self) -> String {
+        match self {
+            Address::IPv4(ip, _) => format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]),
+            Address::IPv6(ip, _) => std::net::Ipv6Addr::from(*ip).to_string(),
+            Address::Domain(host, _) => host.clone(),
+        }
+    }
+}
+
 impl fmt::Display for Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.to_socket_string())
@@ -52,6 +64,18 @@ impl fmt::Display for Address {
 pub enum OutboundType {
     Direct,
     Reject,
+    /// Proxy connection via ACL engine outbound handler (Socks5, Http, etc.)
+    Proxy(Arc<dyn acl_engine_rs::outbound::AsyncOutbound>),
+}
+
+impl fmt::Debug for OutboundType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OutboundType::Direct => write!(f, "Direct"),
+            OutboundType::Reject => write!(f, "Reject"),
+            OutboundType::Proxy(_) => write!(f, "Proxy"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

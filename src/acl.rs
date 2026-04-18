@@ -735,19 +735,16 @@ impl server_anytls_rs::OutboundRouter for AclRouter {
         }
 
         // Extract host string for ACL matching
-        let (host, port) = match addr {
-            Address::IPv4(ip, port) => (format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]), *port),
-            Address::IPv6(ip, port) => {
-                let std_ip = std::net::Ipv6Addr::from(*ip);
-                (std_ip.to_string(), *port)
-            }
-            Address::Domain(host, port) => (host.clone(), *port),
-        };
+        let host = addr.host_string();
+        let port = addr.port();
 
         match self.engine.match_host(&host, port, Protocol::TCP) {
             Some(handler) => match &*handler {
+                OutboundHandler::Direct(_) => OutboundType::Direct,
+                OutboundHandler::Socks5 { .. } | OutboundHandler::Http(_) => {
+                    OutboundType::Proxy(handler)
+                }
                 OutboundHandler::Reject(_) => OutboundType::Reject,
-                _ => OutboundType::Direct, // Direct, Socks5, Http all map to Direct
             },
             None => OutboundType::Direct,
         }
@@ -1851,5 +1848,55 @@ acl:
         assert!(!is_private_ipv6(&[
             0x26, 0x06, 0x47, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
         ]));
+    }
+
+    /// ACL should return Proxy(handler) for domains matching a socks5 outbound rule,
+    /// not Direct. This is the bug: socks5/http handlers were mapped to Direct.
+    #[tokio::test]
+    async fn test_acl_router_returns_proxy_for_socks5_rule() {
+        use server_anytls_rs::{Address, OutboundRouter, OutboundType};
+
+        // Build an engine with a socks5 outbound + rule routing example.com through it
+        let config = AclConfig {
+            outbounds: vec![OutboundEntry {
+                name: "warp".to_string(),
+                outbound_type: "socks5".to_string(),
+                socks5: Some(Socks5Config {
+                    addr: "127.0.0.1:40000".to_string(),
+                    username: None,
+                    password: None,
+                    allow_udp: true,
+                }),
+                http: None,
+                direct: None,
+            }],
+            acl: AclRules {
+                inline: vec![
+                    "warp(example.com)".to_string(),
+                    "direct(all)".to_string(),
+                ],
+            },
+        };
+
+        let engine = AclEngine::new(config, None, false).await.unwrap();
+        let router = AclRouter::with_block_private_ip(engine, false);
+
+        // example.com should be routed through the socks5 proxy, not direct
+        let addr = Address::Domain("example.com".to_string(), 443);
+        let result = router.route(&addr).await;
+        assert!(
+            matches!(result, OutboundType::Proxy(_)),
+            "expected Proxy for socks5-routed domain, got {:?}",
+            result
+        );
+
+        // other domains should still be direct
+        let addr = Address::Domain("other.com".to_string(), 80);
+        let result = router.route(&addr).await;
+        assert!(
+            matches!(result, OutboundType::Direct),
+            "expected Direct for unmatched domain, got {:?}",
+            result
+        );
     }
 }
