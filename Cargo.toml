@@ -1,6 +1,6 @@
 [package]
 name = "server-anytls-rs"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 
 [[bin]]
@@ -78,6 +78,18 @@ harness = false
 
 [[bench]]
 name = "dns_bench"
+harness = false
+
+[[bench]]
+name = "write_frame_alloc_bench"
+harness = false
+
+[[bench]]
+name = "host_string_bench"
+harness = false
+
+[[bench]]
+name = "lock_contention_bench"
 harness = false
 
 [profile.release]
