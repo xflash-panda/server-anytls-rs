@@ -126,6 +126,9 @@ pub(crate) async fn handle_stream<T: AsyncRead + AsyncWrite + Unpin + Send + 'st
 
     let (target, consumed) = parse_socks_address(&buf[..n])?;
 
+    // Count each stream as one request (connection is multiplexed)
+    server.stats.record_request(user_id);
+
     if is_udp_over_tcp(&target) {
         let trailing = buf[consumed..n].to_vec();
         return crate::udp_relay::handle_udp_over_tcp(server, session, stream, trailing, user_id)
@@ -394,30 +397,45 @@ mod tests {
         assert!(!is_udp_over_tcp(&addr));
     }
 
+    use crate::core::hooks::{DirectRouter, SinglePasswordAuth, StatsCollector, UserId};
+    use crate::core::padding::{DEFAULT_SCHEME, PaddingFactory};
+    use crate::core::server::Server;
+    use crate::core::session::{Session, SessionConfig};
+    use crate::core::stream::{Stream, WriteCommand};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct RecordingStats {
+        upload: AtomicU64,
+        download: AtomicU64,
+        request_count: AtomicU64,
+    }
+
+    impl RecordingStats {
+        fn new() -> Self {
+            Self {
+                upload: AtomicU64::new(0),
+                download: AtomicU64::new(0),
+                request_count: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl StatsCollector for RecordingStats {
+        fn record_upload(&self, _uid: UserId, bytes: u64) {
+            self.upload.fetch_add(bytes, Ordering::Relaxed);
+        }
+        fn record_download(&self, _uid: UserId, bytes: u64) {
+            self.download.fetch_add(bytes, Ordering::Relaxed);
+        }
+        fn record_request(&self, _uid: UserId) {
+            self.request_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// When `copy_bidirectional` errors mid-relay (e.g. connection reset),
     /// partial traffic should still be recorded.
     #[tokio::test]
     async fn test_handle_stream_records_traffic_on_relay_error() {
-        use crate::core::hooks::{DirectRouter, SinglePasswordAuth, StatsCollector, UserId};
-        use crate::core::padding::{DEFAULT_SCHEME, PaddingFactory};
-        use crate::core::server::Server;
-        use crate::core::session::{Session, SessionConfig};
-        use crate::core::stream::{Stream, WriteCommand};
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        struct RecordingStats {
-            upload: AtomicU64,
-            download: AtomicU64,
-        }
-        impl StatsCollector for RecordingStats {
-            fn record_upload(&self, _uid: UserId, bytes: u64) {
-                self.upload.fetch_add(bytes, Ordering::Relaxed);
-            }
-            fn record_download(&self, _uid: UserId, bytes: u64) {
-                self.download.fetch_add(bytes, Ordering::Relaxed);
-            }
-        }
-
         // TCP server that reads some data, sends some back, then RSTs
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_addr = listener.local_addr().unwrap();
@@ -439,10 +457,7 @@ mod tests {
             }
         });
 
-        let recording = Arc::new(RecordingStats {
-            upload: AtomicU64::new(0),
-            download: AtomicU64::new(0),
-        });
+        let recording = Arc::new(RecordingStats::new());
 
         let server = Arc::new(
             Server::builder()
@@ -499,30 +514,11 @@ mod tests {
             up > 0 || down > 0,
             "expected some traffic to be recorded on relay error, got upload={up} download={down}"
         );
+        assert_eq!(recording.request_count.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
     async fn test_handle_stream_records_traffic_stats() {
-        use crate::core::hooks::{DirectRouter, SinglePasswordAuth, StatsCollector, UserId};
-        use crate::core::padding::{DEFAULT_SCHEME, PaddingFactory};
-        use crate::core::server::Server;
-        use crate::core::session::{Session, SessionConfig};
-        use crate::core::stream::{Stream, WriteCommand};
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        struct RecordingStats {
-            upload: AtomicU64,
-            download: AtomicU64,
-        }
-        impl StatsCollector for RecordingStats {
-            fn record_upload(&self, _uid: UserId, bytes: u64) {
-                self.upload.fetch_add(bytes, Ordering::Relaxed);
-            }
-            fn record_download(&self, _uid: UserId, bytes: u64) {
-                self.download.fetch_add(bytes, Ordering::Relaxed);
-            }
-        }
-
         // Echo server
         let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_addr = echo.local_addr().unwrap();
@@ -533,10 +529,7 @@ mod tests {
             }
         });
 
-        let recording = Arc::new(RecordingStats {
-            upload: AtomicU64::new(0),
-            download: AtomicU64::new(0),
-        });
+        let recording = Arc::new(RecordingStats::new());
 
         let server = Arc::new(
             Server::builder()
@@ -586,5 +579,6 @@ mod tests {
         let down = recording.download.load(Ordering::Relaxed);
         assert!(up > 0, "expected upload bytes to be recorded, got 0");
         assert!(down > 0, "expected download bytes to be recorded, got 0");
+        assert_eq!(recording.request_count.load(Ordering::Relaxed), 1);
     }
 }
