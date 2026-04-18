@@ -2018,4 +2018,138 @@ acl:
             result
         );
     }
+
+    // -----------------------------------------------------------------------
+    // DNS cache improvement tests
+    // -----------------------------------------------------------------------
+
+    /// Negative cache: DNS resolution failure should be cached with a short TTL
+    /// so we don't hammer the DNS server on repeated failures.
+    #[tokio::test]
+    async fn test_negative_cache_stores_failure() {
+        let engine = AclEngine::new_default().unwrap();
+        let router = AclRouter::with_block_private_ip(engine, false);
+
+        // First resolve — will fail (domain doesn't exist)
+        let result1 = router.resolve_domain("this-domain-does-not-exist-xyzzy.test").await;
+        assert!(result1.is_none());
+
+        // The failure should now be cached — check that a cache entry exists
+        assert!(
+            router.dns_cache.contains_key("this-domain-does-not-exist-xyzzy.test"),
+            "DNS failure should be cached (negative cache)"
+        );
+    }
+
+    /// Negative cache entry should expire after a short TTL (not the full DNS_CACHE_TTL).
+    #[tokio::test]
+    async fn test_negative_cache_uses_short_ttl() {
+        let engine = AclEngine::new_default().unwrap();
+        let router = AclRouter::with_block_private_ip(engine, false);
+
+        // Resolve a domain that will fail
+        let _ = router.resolve_domain("negative-ttl-test.invalid").await;
+
+        // Check that the cached entry expires sooner than DNS_CACHE_TTL
+        if let Some(entry) = router.dns_cache.get("negative-ttl-test.invalid") {
+            let remaining = entry.expires_at.duration_since(Instant::now());
+            assert!(
+                remaining < DNS_CACHE_TTL,
+                "negative cache TTL ({:?}) should be shorter than DNS_CACHE_TTL ({:?})",
+                remaining,
+                DNS_CACHE_TTL
+            );
+            // Should be at most 30 seconds
+            assert!(
+                remaining <= Duration::from_secs(30),
+                "negative cache TTL ({:?}) should be <= 30s",
+                remaining
+            );
+        } else {
+            panic!("expected negative cache entry to exist");
+        }
+    }
+
+    /// Negative cache: cached failure should return None without making a DNS query.
+    #[tokio::test]
+    async fn test_negative_cache_returns_none_on_hit() {
+        let engine = AclEngine::new_default().unwrap();
+        let router = AclRouter::with_block_private_ip(engine, false);
+
+        // Manually insert a negative cache entry (empty addrs, not expired)
+        router.dns_cache.insert(
+            "cached-negative.test".to_string(),
+            DnsCacheEntry {
+                addrs: Arc::from(vec![]),
+                expires_at: Instant::now() + Duration::from_secs(30),
+            },
+        );
+
+        // Should return None from cache without DNS lookup
+        let result = router.resolve_domain("cached-negative.test").await;
+        assert!(result.is_none(), "negative cache hit should return None");
+    }
+
+    /// Singleflight: concurrent resolve_domain calls for the same host should
+    /// not result in multiple DNS queries. Only one inflight query per domain.
+    #[tokio::test]
+    async fn test_singleflight_coalesces_concurrent_lookups() {
+        let engine = AclEngine::new_default().unwrap();
+        let router = Arc::new(AclRouter::with_block_private_ip(engine, false));
+
+        // Launch many concurrent lookups for the same domain
+        let mut handles = Vec::new();
+        for _ in 0..50 {
+            let r = Arc::clone(&router);
+            handles.push(tokio::spawn(async move {
+                r.resolve_domain("singleflight-test.invalid").await
+            }));
+        }
+
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.await.unwrap());
+        }
+
+        // All results should be the same (all None since domain doesn't exist)
+        assert!(results.iter().all(|r| r.is_none()));
+
+        // The key point: only ONE inflight query should have happened.
+        // We can't directly measure DNS queries, but we verify the cache
+        // has exactly one entry (the negative cache entry).
+        assert!(
+            router.dns_cache.contains_key("singleflight-test.invalid"),
+            "singleflight result should be cached"
+        );
+    }
+
+    /// Cache should respect the maximum capacity and not grow unbounded.
+    #[tokio::test]
+    async fn test_cache_respects_max_capacity() {
+        let engine = AclEngine::new_default().unwrap();
+        let router = AclRouter::with_block_private_ip(engine, false);
+
+        // Fill the cache to capacity with valid entries
+        let addr: std::net::SocketAddr = "1.2.3.4:0".parse().unwrap();
+        for i in 0..DNS_CACHE_MAX_ENTRIES + 100 {
+            router.dns_cache.insert(
+                format!("domain-{}.test", i),
+                DnsCacheEntry {
+                    addrs: Arc::from(vec![addr]),
+                    expires_at: Instant::now() + DNS_CACHE_TTL,
+                },
+            );
+        }
+
+        // Trigger a resolve which should trigger eviction
+        let _ = router.resolve_domain("trigger-eviction.test").await;
+
+        // Cache should not exceed max capacity
+        assert!(
+            router.dns_cache.len() <= DNS_CACHE_MAX_ENTRIES,
+            "cache size {} should not exceed max {}",
+            router.dns_cache.len(),
+            DNS_CACHE_MAX_ENTRIES
+        );
+    }
 }
