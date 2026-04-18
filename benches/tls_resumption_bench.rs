@@ -24,10 +24,8 @@ fn make_tls_configs(
         .with_single_cert(vec![cert_der.clone()], key_der)
         .unwrap();
 
-    if enable_tickets {
-        if let Ok(ticketer) = rustls::crypto::aws_lc_rs::Ticketer::new() {
-            server_config.ticketer = ticketer;
-        }
+    if enable_tickets && let Ok(ticketer) = rustls::crypto::aws_lc_rs::Ticketer::new() {
+        server_config.ticketer = ticketer;
     }
 
     let mut root_store = rustls::RootCertStore::empty();

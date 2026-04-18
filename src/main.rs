@@ -106,7 +106,7 @@ async fn main() -> Result<()> {
         builder = builder.padding_scheme(rules.join("\n"));
     }
 
-    let server = Arc::new(builder.build());
+    let server = Arc::new(builder.build()?);
 
     // Start background tasks with user kick callback
     let task_config = TaskConfig::new(
