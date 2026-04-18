@@ -43,8 +43,12 @@ pub(crate) async fn read_auth<R: AsyncRead + Unpin>(
     }
 
     if padding_len > 0 {
-        let mut padding = vec![0u8; padding_len as usize];
-        reader.read_exact(&mut padding).await?;
+        // Stack buffer — MAX_PADDING_LEN is 1024, fits comfortably on stack.
+        // Avoids a heap allocation for data that is immediately discarded.
+        let mut padding = [0u8; MAX_PADDING_LEN as usize];
+        reader
+            .read_exact(&mut padding[..padding_len as usize])
+            .await?;
     }
 
     Ok(user_id)

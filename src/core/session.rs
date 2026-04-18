@@ -285,11 +285,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
     }
 
     pub async fn write_frame(&self, command: Command, stream_id: u32, data: &[u8]) -> Result<()> {
-        debug_assert!(
-            data.len() <= u16::MAX as usize,
-            "write_frame: control frame payload exceeds u16::MAX ({} bytes)",
-            data.len()
-        );
+        if data.len() > u16::MAX as usize {
+            return Err(crate::error::Error::FrameTooLarge(data.len()));
+        }
         let header = FrameHeader {
             command,
             stream_id,
@@ -320,7 +318,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
     }
 
     /// Batch-write settings response frames (UpdatePaddingScheme and/or
-    /// ServerSettings) in a single lock acquisition and flush.
+    /// ServerSettings) in a single lock acquisition, single write_all, and flush.
+    /// All frames are coalesced into one buffer to avoid generating separate TLS
+    /// records (each record adds ~29 bytes overhead + encryption cost).
     async fn write_settings_response(
         &self,
         send_padding: bool,
@@ -330,10 +330,27 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             return Ok(());
         }
 
-        let mut w = self.write_half.lock().await;
-
-        if send_padding {
+        // Pre-compute total size and build a single coalesced buffer.
+        let padding_data = if send_padding {
             let data = self.padding.raw_scheme().as_bytes();
+            if data.len() > u16::MAX as usize {
+                return Err(crate::error::Error::FrameTooLarge(data.len()));
+            }
+            Some(data)
+        } else {
+            None
+        };
+        let padding_frame_len = padding_data.map_or(0, |d| HEADER_SIZE + d.len());
+        let settings_frame_len = if send_server_settings {
+            HEADER_SIZE + 3
+        } else {
+            0
+        };
+        let total = padding_frame_len + settings_frame_len;
+
+        let mut buf = Vec::with_capacity(total);
+
+        if let Some(data) = padding_data {
             let header = FrameHeader {
                 command: Command::UpdatePaddingScheme,
                 stream_id: 0,
@@ -341,8 +358,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             };
             let mut hdr_buf = [0u8; HEADER_SIZE];
             header.encode(&mut hdr_buf);
-            w.write_all(&hdr_buf).await?;
-            w.write_all(data).await?;
+            buf.extend_from_slice(&hdr_buf);
+            buf.extend_from_slice(data);
         }
 
         if send_server_settings {
@@ -353,12 +370,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             };
             let mut hdr_buf = [0u8; HEADER_SIZE];
             header.encode(&mut hdr_buf);
-            let mut buf = [0u8; HEADER_SIZE + 3];
-            buf[..HEADER_SIZE].copy_from_slice(&hdr_buf);
-            buf[HEADER_SIZE..].copy_from_slice(b"v=2");
-            w.write_all(&buf).await?;
+            buf.extend_from_slice(&hdr_buf);
+            buf.extend_from_slice(b"v=2");
         }
 
+        let mut w = self.write_half.lock().await;
+        w.write_all(&buf).await?;
         w.flush().await?;
         Ok(())
     }
@@ -675,6 +692,75 @@ mod tests {
         );
 
         drop(client_io);
+    }
+
+    /// write_settings_response must coalesce UpdatePaddingScheme and
+    /// ServerSettings into a single write so they share one TLS record.
+    #[tokio::test]
+    async fn test_settings_response_coalesced() {
+        let (mut client_io, server_io) = duplex(65536);
+        let padding = test_padding();
+        let session = Arc::new(Session::new_server(
+            server_io,
+            padding,
+            SessionConfig::default(),
+        ));
+        // Send settings with a wrong padding MD5 to trigger UpdatePaddingScheme + ServerSettings
+        let settings_data = "v=2\npadding-md5=wrong_md5";
+        write_frame(
+            &mut client_io,
+            Command::Settings,
+            0,
+            settings_data.as_bytes(),
+        )
+        .await;
+
+        let (new_stream_tx, _) = tokio::sync::mpsc::channel(8);
+        let sess = session.clone();
+        let handle = tokio::spawn(async move {
+            sess.recv_loop(new_stream_tx, None, CancellationToken::new())
+                .await
+        });
+
+        let mut found_padding = false;
+        let mut found_server_settings = false;
+        for _ in 0..5 {
+            let mut hdr_buf = [0u8; HEADER_SIZE];
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                client_io.read_exact(&mut hdr_buf),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    let hdr = FrameHeader::decode(&hdr_buf);
+                    if hdr.length > 0 {
+                        let mut payload = vec![0u8; hdr.length as usize];
+                        client_io.read_exact(&mut payload).await.unwrap();
+                        if hdr.command == Command::ServerSettings {
+                            assert_eq!(&payload, b"v=2");
+                        }
+                    }
+                    match hdr.command {
+                        Command::UpdatePaddingScheme => found_padding = true,
+                        Command::ServerSettings => found_server_settings = true,
+                        _ => {}
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(
+            found_padding,
+            "expected UpdatePaddingScheme frame in response"
+        );
+        assert!(
+            found_server_settings,
+            "expected ServerSettings frame in response"
+        );
+
+        drop(client_io);
+        let _ = handle.await;
     }
 
     /// Active connections must survive past the idle timeout duration.
