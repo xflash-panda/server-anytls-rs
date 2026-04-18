@@ -50,11 +50,15 @@ async fn write_psh_frames<W: AsyncWriteExt + Unpin>(
 
 pub struct SessionConfig {
     pub max_streams: usize,
+    pub write_cmd_capacity: usize,
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
-        Self { max_streams: 256 }
+        Self {
+            max_streams: 256,
+            write_cmd_capacity: 512,
+        }
     }
 }
 
@@ -92,7 +96,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
         let mut settings_received = false;
 
         // Create the write command channel and spawn writer task
-        let (write_cmd_tx, mut write_cmd_rx) = mpsc::channel::<WriteCommand>(256);
+        let (write_cmd_tx, mut write_cmd_rx) =
+            mpsc::channel::<WriteCommand>(self.config.write_cmd_capacity);
         let writer = self.write_half.clone();
         tokio::spawn(async move {
             // Reusable buffer for coalescing header+payload into single writes.
@@ -990,6 +995,177 @@ mod tests {
             total_expected, total
         );
 
+        drop(client_io);
+        let _ = handle.await;
+    }
+
+    /// Issue #2: write_cmd channel (capacity 256) shared by ALL streams.
+    /// Verify that the writer task's try_recv batch drains the entire channel
+    /// under a single lock hold. When the batch is large (many streams writing
+    /// simultaneously), the lock is held for a long time, starving control frames.
+    /// This test verifies data from multiple streams flows through correctly.
+    #[tokio::test]
+    async fn test_write_cmd_shared_channel_multiple_streams() {
+        let (mut client_io, server_io) = duplex(2 * 1024 * 1024);
+        let padding = test_padding();
+        let session = Arc::new(Session::new_server(
+            server_io,
+            padding,
+            SessionConfig::default(),
+        ));
+        let settings_data = format!("v=2\npadding-md5={}", session.padding_md5());
+        write_frame(
+            &mut client_io,
+            Command::Settings,
+            0,
+            settings_data.as_bytes(),
+        )
+        .await;
+
+        // Create 5 streams
+        for i in 1..=5u32 {
+            write_frame(&mut client_io, Command::Syn, i, &[]).await;
+        }
+
+        let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
+        let sess = session.clone();
+        let handle = tokio::spawn(async move {
+            sess.recv_loop(new_stream_tx, None, CancellationToken::new())
+                .await
+        });
+
+        let mut streams = Vec::new();
+        for _ in 0..5 {
+            let stream =
+                tokio::time::timeout(std::time::Duration::from_secs(1), new_stream_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            streams.push(stream);
+        }
+
+        // Each stream writes 20 chunks of 1KB through the SHARED write_cmd channel.
+        // Total: 5 streams * 20 * 1KB = 100KB. All competing for capacity 256.
+        let chunk = vec![0xCD_u8; 1024];
+        let mut write_handles = Vec::new();
+        for mut stream in streams {
+            let data = chunk.clone();
+            write_handles.push(tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                for _ in 0..20 {
+                    stream.write_all(&data).await.unwrap();
+                }
+            }));
+        }
+
+        // Drain output concurrently so writer doesn't block on duplex.
+        let drain = tokio::spawn(async move {
+            let mut buf = [0u8; 65536];
+            loop {
+                match client_io.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+
+        // All 100 writes (5*20) must complete within 2 seconds.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            for h in write_handles {
+                h.await.unwrap();
+            }
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "concurrent writes from 5 streams timed out — write_cmd channel bottleneck"
+        );
+
+        drain.abort();
+        let _ = handle.await;
+    }
+
+    /// Issue #3: write_frame (control) and writer task (data) share write_half
+    /// mutex. The writer task's try_recv loop drains ALL pending data under one
+    /// lock hold, blocking control frames. This test sends a HeartRequest while
+    /// a stream is actively writing and verifies HeartResponse arrives promptly.
+    #[tokio::test]
+    async fn test_control_frame_not_starved_by_data_writes() {
+        let (mut client_io, server_io) = duplex(2 * 1024 * 1024);
+        let padding = test_padding();
+        let session = Arc::new(Session::new_server(
+            server_io,
+            padding,
+            SessionConfig::default(),
+        ));
+        let settings_data = format!("v=2\npadding-md5={}", session.padding_md5());
+        write_frame(
+            &mut client_io,
+            Command::Settings,
+            0,
+            settings_data.as_bytes(),
+        )
+        .await;
+        write_frame(&mut client_io, Command::Syn, 1, &[]).await;
+
+        let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
+        let sess = session.clone();
+        let handle = tokio::spawn(async move {
+            sess.recv_loop(new_stream_tx, None, CancellationToken::new())
+                .await
+        });
+
+        let mut stream =
+            tokio::time::timeout(std::time::Duration::from_secs(1), new_stream_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+
+        // Stream writes 50 * 4KB = 200KB to keep writer task busy.
+        let write_task = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let data = vec![0xAB_u8; 4096];
+            for _ in 0..50 {
+                if stream.write_all(&data).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Let writer task start processing
+        tokio::task::yield_now().await;
+
+        // Send HeartRequest — response requires write_frame (same mutex)
+        write_frame(&mut client_io, Command::HeartRequest, 0, &[]).await;
+
+        // Read all frames, look for HeartResponse
+        let mut hdr_buf = [0u8; HEADER_SIZE];
+        let mut skip_buf = vec![0u8; 65536];
+
+        let found_heart = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                client_io.read_exact(&mut hdr_buf).await.unwrap();
+                let hdr = FrameHeader::decode(&hdr_buf);
+                if hdr.length > 0 {
+                    client_io
+                        .read_exact(&mut skip_buf[..hdr.length as usize])
+                        .await
+                        .unwrap();
+                }
+                if hdr.command == Command::HeartResponse {
+                    return true;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            found_heart,
+            "HeartResponse not received — control frame starved by data writer mutex"
+        );
+
+        write_task.abort();
         drop(client_io);
         let _ = handle.await;
     }

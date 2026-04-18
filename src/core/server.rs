@@ -62,6 +62,7 @@ impl Server {
     pub fn session_config(&self) -> SessionConfig {
         SessionConfig {
             max_streams: self.config.max_streams_per_session,
+            ..SessionConfig::default()
         }
     }
 
