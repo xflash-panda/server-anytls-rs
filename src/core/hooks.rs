@@ -1,4 +1,5 @@
 use std::fmt;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -62,7 +63,11 @@ impl fmt::Display for Address {
 // ---------------------------------------------------------------------------
 
 pub enum OutboundType {
-    Direct,
+    /// Direct connection, optionally carrying pre-resolved socket addresses
+    /// from DNS lookup in the router (avoids duplicate resolution in connect).
+    Direct {
+        resolved: Option<Arc<[SocketAddr]>>,
+    },
     Reject,
     /// Proxy connection via ACL engine outbound handler (Socks5, Http, etc.)
     Proxy(Arc<dyn acl_engine_rs::outbound::AsyncOutbound>),
@@ -71,7 +76,7 @@ pub enum OutboundType {
 impl fmt::Debug for OutboundType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            OutboundType::Direct => write!(f, "Direct"),
+            OutboundType::Direct { .. } => write!(f, "Direct"),
             OutboundType::Reject => write!(f, "Reject"),
             OutboundType::Proxy(_) => write!(f, "Proxy"),
         }
@@ -155,7 +160,7 @@ pub struct DirectRouter;
 #[async_trait]
 impl OutboundRouter for DirectRouter {
     async fn route(&self, _target: &Address) -> OutboundType {
-        OutboundType::Direct
+        OutboundType::Direct { resolved: None }
     }
 }
 
@@ -193,7 +198,7 @@ mod tests {
         let router = DirectRouter;
         let addr = Address::Domain("example.com".to_string(), 80);
         let result = router.route(&addr).await;
-        assert!(matches!(result, OutboundType::Direct));
+        assert!(matches!(result, OutboundType::Direct { .. }));
     }
 
     fn sha2_hash(data: &[u8]) -> [u8; 32] {

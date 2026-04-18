@@ -137,8 +137,11 @@ pub(crate) async fn handle_stream<T: AsyncRead + AsyncWrite + Unpin + Send + 'st
     let trailing = buf[consumed..n].to_vec();
     let outbound = server.router.route(&target).await;
     match outbound {
-        OutboundType::Direct => {
-            proxy_tcp(server, session, stream, &target, trailing, user_id).await
+        OutboundType::Direct { resolved } => {
+            proxy_tcp(
+                server, session, stream, &target, trailing, user_id, resolved,
+            )
+            .await
         }
         OutboundType::Proxy(handler) => {
             proxy_tcp_via_handler(server, session, stream, &target, trailing, user_id, handler)
@@ -161,11 +164,15 @@ async fn proxy_tcp<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     target: &Address,
     trailing: Vec<u8>,
     user_id: UserId,
+    resolved: Option<Arc<[std::net::SocketAddr]>>,
 ) -> Result<()> {
     let stream_id = stream.id();
 
-    let connect_result =
-        tokio::time::timeout(server.config.tcp_connect_timeout, connect_target(target)).await;
+    let connect_result = tokio::time::timeout(
+        server.config.tcp_connect_timeout,
+        connect_target(target, resolved),
+    )
+    .await;
 
     let remote = match connect_result {
         Ok(Ok(tcp)) => tcp,
@@ -292,7 +299,32 @@ where
 }
 
 /// Resolve and connect to the target address.
-async fn connect_target(target: &Address) -> std::io::Result<TcpStream> {
+/// When `resolved` is provided (from the router's DNS lookup), uses those addresses
+/// directly instead of resolving the domain again — avoids duplicate DNS lookups.
+async fn connect_target(
+    target: &Address,
+    resolved: Option<Arc<[SocketAddr]>>,
+) -> std::io::Result<TcpStream> {
+    // If the router already resolved the domain, connect using those addresses directly.
+    if let Some(ref addrs) = resolved
+        && !addrs.is_empty()
+    {
+        let port = target.port();
+        let mut last_err = None;
+        for addr in addrs.iter() {
+            let mut addr = *addr;
+            addr.set_port(port);
+            match TcpStream::connect(addr).await {
+                Ok(stream) => {
+                    let _ = stream.set_nodelay(true);
+                    return Ok(stream);
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        return Err(last_err.unwrap_or_else(|| std::io::Error::other("no resolved addresses")));
+    }
+
     let stream = match target {
         Address::IPv4(ip, port) => {
             let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(*ip), *port));
