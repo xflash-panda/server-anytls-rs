@@ -10,7 +10,8 @@ A high-performance [AnyTLS](https://github.com/anytls/anytls-go) proxy server im
 - Optional ACL-based traffic routing
 - Connection management with user kick-off and graceful shutdown
 - Dynamic padding scheme support
-- Panel integration for node configuration and user management
+- Panel integration via Connect-RPC over QUIC/HTTP3
+- Server-side keepalive to prevent NAT idle connection drops
 - jemalloc allocator for optimized memory performance
 
 ## Build
@@ -22,9 +23,9 @@ cargo build --release
 ## Usage
 
 ```bash
-server-anytls \
-  --api https://panel.example.com/api \
-  --token <api-token> \
+server-anytls-agent \
+  --server_host 10.0.0.1 \
+  --port 8082 \
   --node <node-id> \
   --cert_file /path/to/server.crt \
   --key_file /path/to/server.key
@@ -36,17 +37,20 @@ All arguments support environment variables with `X_PANDA_ANYTLS_` prefix.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--api` | (required) | Panel API endpoint |
-| `--token` | (required) | API authentication token |
+| `--server_host` | `127.0.0.1` | Panel Connect-RPC server host |
+| `--port` | `8082` | Panel Connect-RPC server port |
 | `--node` | (required) | Node ID |
 | `--cert_file` | `/root/.cert/server.crt` | TLS certificate path |
 | `--key_file` | `/root/.cert/server.key` | TLS private key path |
+| `--server_name` | same as `server_host` | TLS SNI for panel connection |
+| `--ca_cert_path` | (none) | CA certificate path for panel TLS (omit for system trust store) |
 | `--fetch_users_interval` | `60s` | User list refresh interval |
 | `--report_traffics_interval` | `80s` | Traffic stats reporting interval |
 | `--heartbeat_interval` | `180s` | Heartbeat interval |
-| `--api_timeout` | `30s` | API call timeout |
+| `--keepalive_interval` | `30s` | Server-side keepalive interval (`0s` to disable) |
+| `--api_timeout` | `15s` | API call timeout |
 | `--log_mode` | `error` | Log level (`error`, `info`, `debug`) |
-| `--data_dir` | `/var/lib/anytls-node` | Data directory |
+| `--data_dir` | `/var/lib/anytls-agent-node` | Data directory |
 | `--acl_conf_file` | (none) | ACL rules YAML file |
 | `--block_private_ip` | `true` | Block private IP connections |
 | `--max_connections` | `10000` | Global connection limit |
