@@ -156,9 +156,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                         debug!("keepalive write failed: {}", e);
                         break;
                     }
-                    // unwrap is safe: guard ensures keepalive_interval is Some
-                    let d = keepalive_interval.unwrap();
-                    keepalive_sleep.as_mut().reset(tokio::time::Instant::now() + d);
+                    if let Some(d) = keepalive_interval {
+                        keepalive_sleep.as_mut().reset(tokio::time::Instant::now() + d);
+                    }
                     continue;
                 }
                 _ = cancel_token.cancelled() => {
