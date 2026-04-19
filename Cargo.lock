@@ -5,6 +5,7 @@ version = 4
 [[package]]
 name = "acl-engine-rs"
 version = "0.4.4"
+source = "git+https://github.com/xflash-panda/acl-engine-rs.git?tag=v0.4.4#411b0893b75e1da88a7eb853400810d260a1d5f1"
 dependencies = [
  "async-trait",
  "base64",
@@ -1560,6 +1561,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 [[package]]
 name = "panel-connect-rpc"
 version = "0.1.7"
+source = "git+https://github.com/xflash-panda/server-panel-rs?tag=v0.1.7#b68ff7552d88de6a2428a47041edd6047cea20ed"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1578,6 +1580,7 @@ dependencies = [
 [[package]]
 name = "panel-core"
 version = "0.1.7"
+source = "git+https://github.com/xflash-panda/server-panel-rs?tag=v0.1.7#b68ff7552d88de6a2428a47041edd6047cea20ed"
 dependencies = [
  "anyhow",
  "arc-swap",
