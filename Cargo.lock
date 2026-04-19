@@ -1946,7 +1946,7 @@ dependencies = [
 
 [[package]]
 name = "server-anytls-rs"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "acl-engine-rs",
  "anyhow",
