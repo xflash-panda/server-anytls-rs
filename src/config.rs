@@ -16,20 +16,31 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     })
 }
 
-const DEFAULT_DATA_DIR: &str = "/var/lib/anytls-node";
+const DEFAULT_DATA_DIR: &str = "/var/lib/anytls-agent-node";
 
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about = "AnyTLS Server with Remote Panel Integration")]
+#[command(
+    author,
+    version,
+    about = "AnyTLS Server Agent with gRPC Panel Integration"
+)]
 #[command(rename_all = "snake_case")]
 pub struct CliArgs {
-    #[arg(long, env = "X_PANDA_ANYTLS_API")]
-    pub api: String,
+    /// gRPC server host (e.g., "127.0.0.1")
+    #[arg(
+        long = "server_host",
+        env = "X_PANDA_ANYTLS_SERVER_HOST",
+        default_value = "127.0.0.1"
+    )]
+    pub server_host: String,
 
-    #[arg(long, env = "X_PANDA_ANYTLS_TOKEN")]
-    pub token: String,
+    /// gRPC server port (e.g., 8082)
+    #[arg(long = "port", env = "X_PANDA_ANYTLS_PORT", default_value_t = 8082)]
+    pub port: u16,
 
+    /// Node ID from the panel (required)
     #[arg(long, env = "X_PANDA_ANYTLS_NODE")]
-    pub node: i64,
+    pub node: u32,
 
     #[arg(
         long,
@@ -54,8 +65,24 @@ pub struct CliArgs {
     #[arg(long, env = "X_PANDA_ANYTLS_HEARTBEAT_INTERVAL", default_value = "180s", value_parser = parse_duration)]
     pub heartbeat_interval: Duration,
 
-    #[arg(long, env = "X_PANDA_ANYTLS_API_TIMEOUT", default_value = "30s", value_parser = parse_duration)]
+    #[arg(long = "api_timeout", env = "X_PANDA_ANYTLS_API_TIMEOUT", default_value = "15s", value_parser = parse_duration)]
     pub api_timeout: Duration,
+
+    /// TLS server name (SNI) for panel connection (defaults to --server_host)
+    #[arg(
+        long = "server_name",
+        env = "X_PANDA_ANYTLS_SERVER_NAME",
+        value_name = "NAME"
+    )]
+    pub server_name: Option<String>,
+
+    /// CA certificate path for panel TLS (omit for system trust store)
+    #[arg(
+        long = "ca_cert_path",
+        env = "X_PANDA_ANYTLS_CA_CERT_PATH",
+        value_name = "PATH"
+    )]
+    pub ca_cert_path: Option<String>,
 
     #[arg(long, env = "X_PANDA_ANYTLS_LOG_MODE", default_value = "error")]
     pub log_mode: String,
@@ -82,13 +109,10 @@ impl CliArgs {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.api.is_empty() {
-            return Err(anyhow!("API endpoint URL is required"));
+        if self.server_host.is_empty() {
+            return Err(anyhow!("gRPC server host is required"));
         }
-        if self.token.is_empty() {
-            return Err(anyhow!("API token is required"));
-        }
-        if self.node <= 0 {
+        if self.node == 0 {
             return Err(anyhow!("Node ID must be a positive integer"));
         }
         if self.cert_file.is_empty() {
@@ -147,31 +171,38 @@ mod tests {
 
     fn create_test_cli_args() -> CliArgs {
         CliArgs {
-            api: "https://api.example.com".to_string(),
-            token: "test-token".to_string(),
+            server_host: "127.0.0.1".to_string(),
+            port: 8082,
             node: 1,
             cert_file: "/path/to/cert.pem".to_string(),
             key_file: "/path/to/key.pem".to_string(),
             fetch_users_interval: Duration::from_secs(60),
             report_traffics_interval: Duration::from_secs(80),
             heartbeat_interval: Duration::from_secs(180),
-            api_timeout: Duration::from_secs(30),
+            api_timeout: Duration::from_secs(15),
             log_mode: "error".to_string(),
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             acl_conf_file: None,
             block_private_ip: true,
             max_connections: 10000,
             refresh_geodata: false,
+            server_name: None,
+            ca_cert_path: None,
         }
     }
 
     #[test]
     fn test_cli_args_defaults() {
         let cli = create_test_cli_args();
+        assert_eq!(cli.server_host, "127.0.0.1");
+        assert_eq!(cli.port, 8082);
         assert_eq!(cli.fetch_users_interval, Duration::from_secs(60));
         assert_eq!(cli.report_traffics_interval, Duration::from_secs(80));
         assert_eq!(cli.heartbeat_interval, Duration::from_secs(180));
+        assert_eq!(cli.api_timeout, Duration::from_secs(15));
         assert_eq!(cli.log_mode, "error");
+        assert!(cli.server_name.is_none());
+        assert!(cli.ca_cert_path.is_none());
     }
 
     #[test]
@@ -181,16 +212,9 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_args_validate_empty_api() {
+    fn test_cli_args_validate_empty_server_host() {
         let mut cli = create_test_cli_args();
-        cli.api = "".to_string();
-        assert!(cli.validate().is_err());
-    }
-
-    #[test]
-    fn test_cli_args_validate_empty_token() {
-        let mut cli = create_test_cli_args();
-        cli.token = "".to_string();
+        cli.server_host = "".to_string();
         assert!(cli.validate().is_err());
     }
 
@@ -199,8 +223,6 @@ mod tests {
         let mut cli = create_test_cli_args();
         cli.node = 0;
         assert!(cli.validate().is_err());
-        cli.node = -1;
-        assert!(cli.validate().is_err());
     }
 
     #[test]
@@ -208,6 +230,41 @@ mod tests {
         let mut cli = create_test_cli_args();
         cli.fetch_users_interval = Duration::ZERO;
         assert!(cli.validate().is_err());
+    }
+
+    #[test]
+    fn test_cli_args_validate_empty_cert() {
+        let mut cli = create_test_cli_args();
+        cli.cert_file = "".to_string();
+        assert!(cli.validate().is_err());
+    }
+
+    #[test]
+    fn test_cli_args_validate_empty_key() {
+        let mut cli = create_test_cli_args();
+        cli.key_file = "".to_string();
+        assert!(cli.validate().is_err());
+    }
+
+    #[test]
+    fn test_cli_args_with_server_name() {
+        let mut cli = create_test_cli_args();
+        cli.server_name = Some("panel.example.com".to_string());
+        assert!(cli.validate().is_ok());
+        assert_eq!(cli.server_name.unwrap(), "panel.example.com");
+    }
+
+    #[test]
+    fn test_cli_args_with_ca_cert_path() {
+        let mut cli = create_test_cli_args();
+        cli.ca_cert_path = Some("/path/to/ca.crt".to_string());
+        assert!(cli.validate().is_ok());
+        assert_eq!(cli.ca_cert_path.unwrap(), "/path/to/ca.crt");
+    }
+
+    #[test]
+    fn test_default_data_dir_value() {
+        assert_eq!(DEFAULT_DATA_DIR, "/var/lib/anytls-agent-node");
     }
 
     #[test]

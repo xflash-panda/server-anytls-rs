@@ -4,10 +4,12 @@ use server_anytls_rs::{Authenticator, StatsCollector, UserId};
 use sha2::{Digest, Sha256};
 
 // Re-export panel types used by main.rs
-pub use panel_core::{
-    BackgroundTasks, StatsCollector as PanelStatsCollector, TaskConfig, UserManager,
+pub use panel_connect_rpc::{
+    ConnectRpcApiManager as ApiManager, ConnectRpcPanelConfig as PanelConfig,
 };
-pub use panel_http::{HttpApiManager as ApiManager, HttpPanelConfig as PanelConfig};
+pub use panel_core::{
+    BackgroundTasks, NodeType, StatsCollector as PanelStatsCollector, TaskConfig, UserManager,
+};
 
 /// SHA-256 key derivation for AnyTLS protocol
 pub fn sha256_key(uuid: &str) -> [u8; 32] {

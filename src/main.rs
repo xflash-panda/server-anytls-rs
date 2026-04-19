@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::business::{
     AnyTlsAuthenticator, AnyTlsStatsCollector, AnyTlsUserManager, ApiManager, BackgroundTasks,
-    PanelConfig, PanelStatsCollector, TaskConfig,
+    NodeType, PanelConfig, PanelStatsCollector, TaskConfig,
 };
 use panel_core::PanelApi;
 use server_anytls_rs::{ConnectionManager, OutboundRouter, StatsCollector};
@@ -27,24 +27,24 @@ async fn main() -> Result<()> {
 
     logger::init_logger(&cli.log_mode);
 
-    log::info!(
-        api = %cli.api,
-        node = cli.node,
-        "Starting AnyTLS server"
-    );
+    log::info!(node = cli.node, "Starting AnyTLS server agent");
 
-    // Create panel config (v0.1.6: uses data_dir instead of state_file_path)
+    // Build panel config from CLI args (connect-rpc via QUIC/H3)
     let panel_config = PanelConfig {
-        api: cli.api.clone(),
-        token: cli.token.clone(),
+        server_host: cli.server_host.clone(),
+        server_port: cli.port,
         node_id: cli.node,
-        node_type: panel_core::NodeType::AnyTls,
-        api_timeout: cli.api_timeout.as_secs(),
-        debug: cli.log_mode == "debug",
+        node_type: NodeType::AnyTls,
         data_dir: cli.data_dir.clone(),
+        api_timeout: cli.api_timeout,
+        server_name: cli
+            .server_name
+            .clone()
+            .unwrap_or_else(|| cli.server_host.clone()),
+        ca_cert_path: cli.ca_cert_path.clone(),
     };
 
-    let api_manager = Arc::new(ApiManager::new(panel_config)?);
+    let api_manager = Arc::new(ApiManager::new(panel_config));
 
     let user_manager = Arc::new(AnyTlsUserManager::new(business::sha256_key));
 
