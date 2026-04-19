@@ -50,7 +50,7 @@ async fn run_multi_stream_download(write_cmd_capacity: usize) {
     let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(16);
     let sess = session.clone();
     let recv_handle = tokio::spawn(async move {
-        sess.recv_loop(new_stream_tx, None, CancellationToken::new())
+        sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
             .await
     });
 
