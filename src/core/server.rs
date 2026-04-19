@@ -21,6 +21,10 @@ pub struct ServerConfig {
     pub tcp_connect_timeout: Duration,
     pub idle_timeout: Duration,
     pub handshake_timeout: Duration,
+    /// Server-side keepalive interval. When set, the server proactively sends
+    /// HeartRequest frames at this interval to prevent NAT devices from
+    /// dropping idle connections.
+    pub keepalive_interval: Option<Duration>,
 }
 
 impl Default for ServerConfig {
@@ -31,6 +35,7 @@ impl Default for ServerConfig {
             tcp_connect_timeout: Duration::from_secs(5),
             idle_timeout: Duration::from_secs(300),
             handshake_timeout: Duration::from_secs(10),
+            keepalive_interval: Some(Duration::from_secs(30)),
         }
     }
 }
@@ -121,6 +126,7 @@ pub struct ServerBuilder {
     tcp_connect_timeout: Duration,
     idle_timeout: Duration,
     handshake_timeout: Duration,
+    keepalive_interval: Option<Duration>,
 }
 
 impl ServerBuilder {
@@ -138,6 +144,7 @@ impl ServerBuilder {
             tcp_connect_timeout: defaults.tcp_connect_timeout,
             idle_timeout: defaults.idle_timeout,
             handshake_timeout: defaults.handshake_timeout,
+            keepalive_interval: defaults.keepalive_interval,
         }
     }
 
@@ -196,6 +203,11 @@ impl ServerBuilder {
         self
     }
 
+    pub fn keepalive_interval(mut self, d: Option<Duration>) -> Self {
+        self.keepalive_interval = d;
+        self
+    }
+
     pub fn build(self) -> anyhow::Result<Server> {
         let authenticator = self
             .authenticator
@@ -218,6 +230,7 @@ impl ServerBuilder {
             tcp_connect_timeout: self.tcp_connect_timeout,
             idle_timeout: self.idle_timeout,
             handshake_timeout: self.handshake_timeout,
+            keepalive_interval: self.keepalive_interval,
         };
 
         let semaphore = Arc::new(Semaphore::new(config.max_connections));

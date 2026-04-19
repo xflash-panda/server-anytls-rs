@@ -119,6 +119,7 @@ pub(crate) async fn handle_connection(
         .recv_loop(
             new_stream_tx,
             Some(server.config.idle_timeout),
+            server.config.keepalive_interval,
             cancel_token,
         )
         .await
