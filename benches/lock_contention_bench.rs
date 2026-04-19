@@ -47,7 +47,7 @@ fn bench_send_fin_idle(c: &mut Criterion) {
                 let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(256);
                 let sess = session.clone();
                 let recv_handle = tokio::spawn(async move {
-                    sess.recv_loop(new_stream_tx, None, CancellationToken::new())
+                    sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
                         .await
                 });
 
@@ -86,7 +86,7 @@ fn bench_send_fin_under_load(c: &mut Criterion) {
                 let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(256);
                 let sess = session.clone();
                 let recv_handle = tokio::spawn(async move {
-                    sess.recv_loop(new_stream_tx, None, CancellationToken::new())
+                    sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
                         .await
                 });
 

@@ -1,0 +1,30 @@
+outbounds:
+  - name: warp
+    type: socks5
+    socks5:
+      addr: 127.0.0.1:40000
+acl:
+  inline:
+    - reject(all, udp/443)
+    - warp(all, tcp/22)
+    - warp(all, tcp/25)
+    - warp(all, tcp/465)
+    - warp(all, tcp/587)
+    - warp(all, tcp/993)
+    - warp(all, tcp/995)
+    - warp(all, tcp/3389)
+    - warp(geosite:openai)
+    - warp(www.google.com)
+    - warp(geosite:google-deepmind)
+    - warp(geosite:sb)
+    - warp(geosite:category-porn)
+    - warp(geosite:netflix)
+    - warp(geosite:disney)
+    - warp(geosite:hbo)
+    - warp(geosite:bahamut)
+    - warp(geosite:tvb)
+    - warp(geosite:tiktok)
+    - warp(geosite:imgur)
+    - warp(geosite:reddit)
+    - warp(suffix:ping0.cc)
+    - direct(all)

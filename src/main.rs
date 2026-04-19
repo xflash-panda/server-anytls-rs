@@ -92,13 +92,20 @@ async fn main() -> Result<()> {
     let anytls_stats = Arc::new(AnyTlsStatsCollector(Arc::clone(&stats_collector)));
     let connection_manager = ConnectionManager::new();
 
+    let keepalive = if cli.keepalive_interval.is_zero() {
+        None
+    } else {
+        Some(cli.keepalive_interval)
+    };
+
     let mut builder = server_anytls_rs::Server::builder()
         .authenticator(authenticator)
         .stats(anytls_stats as Arc<dyn StatsCollector>)
         .router(router)
         .tls_config(tls_config)
         .connection_manager(connection_manager.clone())
-        .max_connections(cli.max_connections);
+        .max_connections(cli.max_connections)
+        .keepalive_interval(keepalive);
 
     if let Some(ref rules) = remote_config.padding_rules
         && !rules.is_empty()
