@@ -236,4 +236,28 @@ mod tests {
         let factory = PaddingFactory::new(scheme).unwrap();
         assert_eq!(factory.raw_scheme(), scheme);
     }
+
+    #[test]
+    fn test_parse_real_panel_padding_rules() {
+        // Simulates the actual string after JSON deserialization from panel response:
+        // "stop=5\r\n0=30-30\r\n1=100-300\r\n2=300-500,c,500-1000,c,500-1000,c,500-1000\r\n3=500-1000\r\n4=500-1000"
+        let scheme = "stop=5\r\n0=30-30\r\n1=100-300\r\n2=300-500,c,500-1000,c,500-1000,c,500-1000\r\n3=500-1000\r\n4=500-1000";
+        let factory = PaddingFactory::new(scheme).unwrap();
+
+        // packet 0: fixed 30
+        let sizes = factory.generate_record_payload_sizes(0);
+        assert_eq!(sizes, vec![30]);
+
+        // packet 1: range 100-300
+        let sizes = factory.generate_record_payload_sizes(1);
+        assert_eq!(sizes.len(), 1);
+        assert!(sizes[0] >= 100 && sizes[0] <= 300);
+
+        // packet 2: has checkmarks
+        let sizes = factory.generate_record_payload_sizes(2);
+        assert!(sizes.contains(&CHECK_MARK));
+
+        // packet 5: beyond stop
+        assert!(factory.generate_record_payload_sizes(5).is_empty());
+    }
 }
