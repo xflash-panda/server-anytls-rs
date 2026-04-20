@@ -22,6 +22,7 @@ use rustls::HandshakeKind;
 use server_anytls_rs::core::frame::{Command, FrameHeader, HEADER_SIZE};
 use server_anytls_rs::core::padding::{DEFAULT_SCHEME, PaddingFactory};
 use server_anytls_rs::{DirectRouter, Server, SinglePasswordAuth};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const PASSWORD: &str = "test-password-e2e";
 
@@ -465,5 +466,197 @@ async fn test_tls_session_resumption() {
         );
     }
 
+    shutdown.cancel();
+}
+
+/// Verify that the accept loop is not blocked when all semaphore permits are held.
+/// The semaphore is acquired after TLS handshake + auth (inside the handler),
+/// so new connections can still complete TLS handshake even at max capacity.
+///
+/// Creates a server with max_connections=2, holds 2 connections, then verifies
+/// a 3rd connection can complete TLS handshake within 500ms.
+#[tokio::test]
+async fn test_accept_loop_not_blocked_by_semaphore() {
+    let (tls_server_config, tls_client_config) = make_tls_configs();
+    let padding = PaddingFactory::new(DEFAULT_SCHEME).unwrap();
+    let padding_md5 = padding.md5_hex().to_string();
+
+    // Server with max_connections=2
+    let server = Arc::new(
+        Server::builder()
+            .authenticator(Arc::new(SinglePasswordAuth::new(PASSWORD)))
+            .router(Arc::new(DirectRouter))
+            .tls_config(tls_server_config)
+            .max_connections(2)
+            .build()
+            .unwrap(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_port = listener.local_addr().unwrap().port();
+    let shutdown = CancellationToken::new();
+    let shutdown_clone = shutdown.clone();
+
+    tokio::spawn(async move {
+        let _ = server.run(listener, shutdown_clone).await;
+    });
+
+    let connector = TlsConnector::from(tls_client_config.clone());
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+
+    // Open 2 connections that complete handshake and hold permits
+    let mut held_connections = Vec::new();
+    for _ in 0..2 {
+        let tcp = TcpStream::connect(format!("127.0.0.1:{}", server_port))
+            .await
+            .unwrap();
+        let mut tls = connector.connect(server_name.clone(), tcp).await.unwrap();
+        // Complete auth + settings so the connection is fully established
+        tls.write_all(&make_auth_packet(PASSWORD)).await.unwrap();
+        let settings_data = format!("v=2\npadding-md5={}", padding_md5);
+        tls.write_all(&encode_frame(
+            Command::Settings,
+            0,
+            settings_data.as_bytes(),
+        ))
+        .await
+        .unwrap();
+        tls.flush().await.unwrap();
+        // Read ServerSettings to confirm session is established
+        for _ in 0..5 {
+            if let Some((hdr, _)) = read_frame(&mut tls).await
+                && hdr.command == Command::ServerSettings
+            {
+                break;
+            }
+        }
+        held_connections.push(tls);
+    }
+
+    // Both permits are now held. Try to open a 3rd connection and complete TLS handshake.
+    // TCP connect may succeed (kernel backlog), but the TLS handshake requires the
+    // server to accept() from kernel queue. With the current bug, the accept loop is
+    // blocked on semaphore.acquire_owned(), so accept() is never called and the TLS
+    // handshake hangs indefinitely.
+    let connector3 = TlsConnector::from(tls_client_config.clone());
+    let server_name3 = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let handshake_result = tokio::time::timeout(Duration::from_millis(500), async {
+        let tcp = TcpStream::connect(format!("127.0.0.1:{}", server_port)).await?;
+        let _tls = connector3.connect(server_name3, tcp).await?;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    })
+    .await;
+
+    assert!(
+        handshake_result.is_ok(),
+        "3rd connection TLS handshake timed out — accept loop is blocked by semaphore"
+    );
+    assert!(
+        handshake_result.unwrap().is_ok(),
+        "3rd connection TLS handshake failed"
+    );
+
+    // Cleanup
+    drop(held_connections);
+    shutdown.cancel();
+}
+
+/// Verify the server handles a burst of concurrent connections under load.
+/// Even with all semaphore permits held, new connections complete TLS handshake
+/// because the accept loop is never blocked by the semaphore.
+///
+/// Creates a server with max_connections=5, holds 5 connections, then fires
+/// 10 parallel connections and asserts at least 5 complete TLS handshake within 500ms.
+#[tokio::test]
+async fn test_burst_connections_accepted_under_load() {
+    let (tls_server_config, tls_client_config) = make_tls_configs();
+    let padding = PaddingFactory::new(DEFAULT_SCHEME).unwrap();
+    let padding_md5 = padding.md5_hex().to_string();
+
+    let server = Arc::new(
+        Server::builder()
+            .authenticator(Arc::new(SinglePasswordAuth::new(PASSWORD)))
+            .router(Arc::new(DirectRouter))
+            .tls_config(tls_server_config)
+            .max_connections(5)
+            .build()
+            .unwrap(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_port = listener.local_addr().unwrap().port();
+    let shutdown = CancellationToken::new();
+    let shutdown_clone = shutdown.clone();
+
+    tokio::spawn(async move {
+        let _ = server.run(listener, shutdown_clone).await;
+    });
+
+    let connector = TlsConnector::from(tls_client_config.clone());
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+
+    // Fill all 5 slots with established connections
+    let mut held = Vec::new();
+    for _ in 0..5 {
+        let tcp = TcpStream::connect(format!("127.0.0.1:{}", server_port))
+            .await
+            .unwrap();
+        let mut tls = connector.connect(server_name.clone(), tcp).await.unwrap();
+        tls.write_all(&make_auth_packet(PASSWORD)).await.unwrap();
+        let settings_data = format!("v=2\npadding-md5={}", padding_md5);
+        tls.write_all(&encode_frame(
+            Command::Settings,
+            0,
+            settings_data.as_bytes(),
+        ))
+        .await
+        .unwrap();
+        tls.flush().await.unwrap();
+        for _ in 0..5 {
+            if let Some((hdr, _)) = read_frame(&mut tls).await
+                && hdr.command == Command::ServerSettings
+            {
+                break;
+            }
+        }
+        held.push(tls);
+    }
+
+    // All 5 permits held. Fire 10 connections in parallel and try TLS handshake.
+    // With the current bug, accept loop is blocked so TLS handshakes never start.
+    // After the fix, connections should be accepted and queued for permits.
+    let success_count = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for _ in 0..10 {
+        let count = success_count.clone();
+        let port = server_port;
+        let cli_cfg = tls_client_config.clone();
+        handles.push(tokio::spawn(async move {
+            let result = tokio::time::timeout(Duration::from_millis(500), async {
+                let tcp = TcpStream::connect(format!("127.0.0.1:{}", port)).await?;
+                let connector = TlsConnector::from(cli_cfg);
+                let sn = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+                let _tls = connector.connect(sn, tcp).await?;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+            })
+            .await;
+            if let Ok(Ok(())) = result {
+                count.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+
+    for h in handles {
+        let _ = h.await;
+    }
+
+    let connected = success_count.load(Ordering::Relaxed);
+    assert!(
+        connected >= 5,
+        "only {connected}/10 burst TLS handshakes completed — \
+         accept loop blocked by semaphore"
+    );
+
+    drop(held);
     shutdown.cancel();
 }

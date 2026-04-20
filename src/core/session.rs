@@ -140,8 +140,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
         // Server-side keepalive: periodically send HeartRequest to prevent
         // NAT devices from dropping idle connections.  The timer resets on
         // every received frame so we only send keepalives when truly idle.
+        // If a HeartRequest goes unanswered by the next tick, the connection
+        // is considered dead.
         let keepalive_sleep = tokio::time::sleep(keepalive_interval.unwrap_or_default());
         tokio::pin!(keepalive_sleep);
+        let mut heartbeat_pending = false;
 
         loop {
             let mut hdr_buf = [0u8; HEADER_SIZE];
@@ -152,10 +155,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                     break;
                 }
                 _ = &mut keepalive_sleep, if keepalive_interval.is_some() => {
+                    if heartbeat_pending {
+                        debug!("heartbeat timeout — no HeartResponse received");
+                        break;
+                    }
                     if let Err(e) = self.write_frame(Command::HeartRequest, 0, &[]).await {
                         debug!("keepalive write failed: {}", e);
                         break;
                     }
+                    heartbeat_pending = true;
                     // unwrap is safe: guard ensures keepalive_interval is Some
                     let d = keepalive_interval.unwrap();
                     keepalive_sleep.as_mut().reset(tokio::time::Instant::now() + d);
@@ -183,6 +191,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                 keepalive_sleep
                     .as_mut()
                     .reset(tokio::time::Instant::now() + d);
+                // Any received frame proves the connection is alive.
+                heartbeat_pending = false;
             }
 
             let header = FrameHeader::decode(&hdr_buf);
@@ -303,7 +313,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                     }
                     self.write_frame(Command::HeartResponse, 0, &[]).await?;
                 }
-                // Waste, HeartResponse, and unknown commands: skip payload
+                // HeartResponse, Waste, and unknown commands: skip payload.
+                // (heartbeat_pending is already cleared by the blanket reset
+                // on any received frame above.)
                 _ => {
                     if len > 0 {
                         payload_buf.resize(len, 0);
@@ -1228,5 +1240,71 @@ mod tests {
 
         drop(client_io);
         let _ = handle.await;
+    }
+
+    /// RED: when the server sends HeartRequest but the client never responds,
+    /// the session should terminate within `heartbeat_timeout`.  Currently
+    /// recv_loop does not track outstanding heartbeats, so this test FAILS.
+    #[tokio::test]
+    async fn test_heartbeat_timeout_terminates_session() {
+        let (mut client_io, server_io) = duplex(65536);
+        let padding = test_padding();
+        let session = Arc::new(Session::new_server(
+            server_io,
+            padding,
+            SessionConfig::default(),
+        ));
+        let settings_data = format!("v=2\npadding-md5={}", session.padding_md5());
+        write_frame(
+            &mut client_io,
+            Command::Settings,
+            0,
+            settings_data.as_bytes(),
+        )
+        .await;
+
+        let (new_stream_tx, _) = tokio::sync::mpsc::channel(8);
+        let sess = session.clone();
+        // keepalive=50ms, heartbeat_timeout=100ms
+        // idle_timeout=10s (long enough to never fire)
+        let handle = tokio::spawn(async move {
+            sess.recv_loop(
+                new_stream_tx,
+                Some(std::time::Duration::from_secs(10)),
+                Some(std::time::Duration::from_millis(50)),
+                CancellationToken::new(),
+            )
+            .await
+        });
+
+        // Client reads frames but does NOT respond to HeartRequest.
+        let drain_task = tokio::spawn(async move {
+            let mut hdr_buf = [0u8; HEADER_SIZE];
+            loop {
+                match client_io.read_exact(&mut hdr_buf).await {
+                    Ok(_) => {
+                        let hdr = FrameHeader::decode(&hdr_buf);
+                        if hdr.length > 0 {
+                            let mut skip = vec![0u8; hdr.length as usize];
+                            if client_io.read_exact(&mut skip).await.is_err() {
+                                break;
+                            }
+                        }
+                        // Deliberately do NOT respond to HeartRequest
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // The session should terminate within ~200ms (heartbeat_timeout
+        // after first unanswered HeartRequest at 50ms).
+        let result = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+        drain_task.abort();
+        assert!(
+            result.is_ok(),
+            "session should terminate when HeartResponse is not received, \
+             but it stayed alive — heartbeat timeout not implemented"
+        );
     }
 }

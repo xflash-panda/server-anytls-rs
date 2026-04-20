@@ -11,6 +11,17 @@ use crate::core::hooks::{Authenticator, NoopStatsCollector, OutboundRouter, Stat
 use crate::core::padding::{DEFAULT_SCHEME, PaddingFactory};
 use crate::core::session::SessionConfig;
 
+/// Enable TCP keepalive on an accepted connection to match Go's default
+/// behavior (SO_KEEPALIVE + 30s interval). Without this, dead connections
+/// hang for 30s–2min during TCP retransmission timeout before being detected.
+fn set_tcp_keepalive(stream: &tokio::net::TcpStream) {
+    let sock = socket2::SockRef::from(stream);
+    let _ = sock.set_keepalive(true);
+    // 30s interval — same as Go's default since 1.13
+    let _ =
+        sock.set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(Duration::from_secs(30)));
+}
+
 // ---------------------------------------------------------------------------
 // ServerConfig
 // ---------------------------------------------------------------------------
@@ -93,15 +104,13 @@ impl Server {
                         }
                     };
                     let _ = tcp_stream.set_nodelay(true);
-                    let permit = self.semaphore.clone().acquire_owned().await;
-                    let Ok(permit) = permit else { continue; };
+                    set_tcp_keepalive(&tcp_stream);
                     let server = self.clone();
                     tokio::spawn(async move {
                         tracing::debug!("new connection from {}", peer_addr);
                         if let Err(e) = crate::handler::handle_connection(server, tcp_stream, peer_addr).await {
                             tracing::debug!("connection from {} ended: {}", peer_addr, e);
                         }
-                        drop(permit);
                     });
                 }
             }
@@ -323,5 +332,32 @@ mod tests {
             .unwrap();
         let sc = server.session_config();
         assert_eq!(sc.max_streams, 128);
+    }
+
+    /// Verify that `set_tcp_keepalive` enables SO_KEEPALIVE on a socket.
+    #[tokio::test]
+    async fn test_accepted_connection_has_tcp_keepalive() {
+        use tokio::net::TcpStream;
+
+        let test_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let test_addr = test_listener.local_addr().unwrap();
+
+        let client_handle =
+            tokio::spawn(async move { TcpStream::connect(test_addr).await.unwrap() });
+
+        let (accepted, _peer) = test_listener.accept().await.unwrap();
+
+        let _ = accepted.set_nodelay(true);
+        set_tcp_keepalive(&accepted);
+
+        let sock = socket2::SockRef::from(&accepted);
+        let keepalive = sock.keepalive().unwrap();
+
+        drop(client_handle);
+
+        assert!(
+            keepalive,
+            "TCP keepalive should be enabled on accepted connections"
+        );
     }
 }
