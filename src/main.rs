@@ -110,7 +110,7 @@ async fn main() -> Result<()> {
     if let Some(ref rules) = remote_config.padding_rules
         && !rules.is_empty()
     {
-        builder = builder.padding_scheme(rules.join("\n"));
+        builder = builder.padding_scheme(rules.as_str());
     }
 
     let server = Arc::new(builder.build()?);
