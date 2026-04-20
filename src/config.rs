@@ -82,11 +82,7 @@ pub struct CliArgs {
     pub server_name: Option<String>,
 
     /// CA certificate path for panel TLS (omit for system trust store)
-    #[arg(
-        long = "ca_file",
-        env = "X_PANDA_ANYTLS_CA_FILE",
-        value_name = "PATH"
-    )]
+    #[arg(long = "ca_file", env = "X_PANDA_ANYTLS_CA_FILE", value_name = "PATH")]
     pub ca_file: Option<String>,
 
     #[arg(long, env = "X_PANDA_ANYTLS_LOG_MODE", default_value = "error")]
