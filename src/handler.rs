@@ -97,11 +97,12 @@ pub(crate) async fn handle_connection(
         conn_mgr.unregister(id);
     });
 
-    let tls_stream = buf_stream.into_inner();
-
+    // Pass the BufReader directly — do NOT call into_inner() which would
+    // discard any data already buffered (e.g. Settings frame arriving in the
+    // same TLS record as auth).
     let padding: PaddingFactory = server.padding.clone();
     let session_config = server.session_config();
-    let session = Arc::new(Session::new_server(tls_stream, padding, session_config));
+    let session = Arc::new(Session::new_server(buf_stream, padding, session_config));
 
     let (new_stream_tx, mut new_stream_rx) = mpsc::channel::<Stream>(256);
 
@@ -211,6 +212,58 @@ mod tests {
 
         // Outer Result is Err(Elapsed) = timeout fired
         assert!(result.is_err(), "expected timeout on stalled reader");
+    }
+
+    /// When auth + Settings arrive in the same TLS record, the BufReader
+    /// buffers both.  The fix: keep reading through the BufReader (don't
+    /// call into_inner()).  This test verifies the data survives.
+    #[tokio::test]
+    async fn test_bufreader_preserves_buffered_data() {
+        use crate::core::frame::{Command, FrameHeader, HEADER_SIZE};
+
+        let password = "mypassword";
+        let padding_len: u16 = 4;
+
+        let auth_packet = make_auth_packet(password, padding_len);
+
+        let settings_header = FrameHeader {
+            command: Command::Settings,
+            stream_id: 0,
+            length: 0,
+        };
+        let mut settings_bytes = [0u8; HEADER_SIZE];
+        settings_header.encode(&mut settings_bytes);
+
+        // Combine auth + Settings into one contiguous write.
+        let mut combined = Vec::with_capacity(auth_packet.len() + HEADER_SIZE);
+        combined.extend_from_slice(&auth_packet);
+        combined.extend_from_slice(&settings_bytes);
+
+        let (mut writer, reader) = duplex(4096);
+        writer.write_all(&combined).await.unwrap();
+        drop(writer);
+
+        // 1. Wrap in BufReader and read auth.
+        let mut buf_reader = tokio::io::BufReader::new(reader);
+        let auth = SinglePasswordAuth::new(password);
+        let user_id = read_auth(&mut buf_reader, &auth).await.unwrap();
+        assert!(user_id.is_some(), "auth should succeed");
+
+        // 2. Keep reading through BufReader (the fix — no into_inner).
+        let mut frame_buf = [0u8; HEADER_SIZE];
+        let n = buf_reader.read_exact(&mut frame_buf).await;
+
+        assert!(
+            n.is_ok(),
+            "Settings frame should be readable through BufReader"
+        );
+
+        let decoded = FrameHeader::decode(&frame_buf);
+        assert_eq!(
+            decoded.command,
+            Command::Settings,
+            "first frame after auth should be Settings"
+        );
     }
 
     #[tokio::test]
