@@ -83,11 +83,11 @@ pub struct CliArgs {
 
     /// CA certificate path for panel TLS (omit for system trust store)
     #[arg(
-        long = "ca_cert_path",
-        env = "X_PANDA_ANYTLS_CA_CERT_PATH",
+        long = "ca_file",
+        env = "X_PANDA_ANYTLS_CA_FILE",
         value_name = "PATH"
     )]
-    pub ca_cert_path: Option<String>,
+    pub ca_file: Option<String>,
 
     #[arg(long, env = "X_PANDA_ANYTLS_LOG_MODE", default_value = "error")]
     pub log_mode: String,
@@ -193,7 +193,7 @@ mod tests {
             max_connections: 10000,
             refresh_geodata: false,
             server_name: None,
-            ca_cert_path: None,
+            ca_file: None,
         }
     }
 
@@ -208,7 +208,7 @@ mod tests {
         assert_eq!(cli.api_timeout, Duration::from_secs(15));
         assert_eq!(cli.log_mode, "error");
         assert!(cli.server_name.is_none());
-        assert!(cli.ca_cert_path.is_none());
+        assert!(cli.ca_file.is_none());
     }
 
     #[test]
@@ -261,11 +261,11 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_args_with_ca_cert_path() {
+    fn test_cli_args_with_ca_file() {
         let mut cli = create_test_cli_args();
-        cli.ca_cert_path = Some("/path/to/ca.crt".to_string());
+        cli.ca_file = Some("/path/to/ca.crt".to_string());
         assert!(cli.validate().is_ok());
-        assert_eq!(cli.ca_cert_path.unwrap(), "/path/to/ca.crt");
+        assert_eq!(cli.ca_file.unwrap(), "/path/to/ca.crt");
     }
 
     #[test]

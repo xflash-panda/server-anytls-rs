@@ -43,7 +43,7 @@ All arguments support environment variables with `X_PANDA_ANYTLS_` prefix.
 | `--cert_file` | `/root/.cert/server.crt` | TLS certificate path |
 | `--key_file` | `/root/.cert/server.key` | TLS private key path |
 | `--server_name` | same as `server_host` | TLS SNI for panel connection |
-| `--ca_cert_path` | (none) | CA certificate path for panel TLS (omit for system trust store) |
+| `--ca_file` | (none) | CA certificate path for panel TLS (omit for system trust store) |
 | `--fetch_users_interval` | `60s` | User list refresh interval |
 | `--report_traffics_interval` | `80s` | Traffic stats reporting interval |
 | `--heartbeat_interval` | `180s` | Heartbeat interval |
