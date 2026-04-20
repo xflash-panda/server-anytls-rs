@@ -279,11 +279,12 @@ where
         bytes_written: download_bytes.clone(),
     };
 
+    const RELAY_BUF_SIZE: usize = 256 * 1024;
     let _relay_result = tokio::io::copy_bidirectional_with_sizes(
         &mut counted_stream,
         &mut counted_remote,
-        65536,
-        65536,
+        RELAY_BUF_SIZE,
+        RELAY_BUF_SIZE,
     )
     .await;
 
