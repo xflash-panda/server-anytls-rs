@@ -62,9 +62,15 @@ impl Default for SessionConfig {
     }
 }
 
+/// BufWriter buffer size for the TLS write half.
+/// Coalesces multiple small writes into fewer, larger TLS records.
+/// Each TLS record has ~29 bytes overhead (header + MAC), so batching
+/// reduces per-record overhead and the number of TCP segments sent.
+const WRITE_BUF_SIZE: usize = 256 * 1024;
+
 pub struct Session<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> {
     read_half: Mutex<tokio::io::ReadHalf<T>>,
-    write_half: Arc<Mutex<tokio::io::WriteHalf<T>>>,
+    write_half: Arc<Mutex<tokio::io::BufWriter<tokio::io::WriteHalf<T>>>>,
     padding: PaddingFactory,
     config: SessionConfig,
     peer_version: AtomicU8,
@@ -75,7 +81,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
         let (read_half, write_half) = tokio::io::split(conn);
         Self {
             read_half: Mutex::new(read_half),
-            write_half: Arc::new(Mutex::new(write_half)),
+            write_half: Arc::new(Mutex::new(tokio::io::BufWriter::with_capacity(
+                WRITE_BUF_SIZE,
+                write_half,
+            ))),
             padding,
             config,
             peer_version: AtomicU8::new(0),

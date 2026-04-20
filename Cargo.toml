@@ -1,6 +1,6 @@
 [package]
 name = "server-anytls-rs"
-version = "0.1.17"
+version = "0.1.18"
 edition = "2024"
 
 [[bin]]
@@ -103,6 +103,10 @@ harness = false
 
 [[bench]]
 name = "padding_clone_bench"
+harness = false
+
+[[bench]]
+name = "download_throughput_bench"
 harness = false
 
 [[bench]]
