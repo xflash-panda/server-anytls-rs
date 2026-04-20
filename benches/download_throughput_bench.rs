@@ -28,9 +28,7 @@ fn make_tls_configs() -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) 
 
     let cert = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let cert_der = CertificateDer::from(cert.cert.der().to_vec());
-    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-        cert.signing_key.serialize_der(),
-    ));
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
 
     let server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -101,8 +99,7 @@ fn bench_download_throughput(c: &mut Criterion) {
                             SessionConfig::default(),
                         ));
 
-                        let (new_stream_tx, mut new_stream_rx) =
-                            tokio::sync::mpsc::channel(8);
+                        let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
                         let sess = session.clone();
                         let cancel = CancellationToken::new();
                         let cancel2 = cancel.clone();
@@ -113,8 +110,7 @@ fn bench_download_throughput(c: &mut Criterion) {
                         let stream = new_stream_rx.recv().await.unwrap();
 
                         // Remote data source
-                        let (remote, mut remote_source) =
-                            tokio::io::duplex(4 * 1024 * 1024);
+                        let (remote, mut remote_source) = tokio::io::duplex(4 * 1024 * 1024);
 
                         let feeder = tokio::spawn(async move {
                             let chunk = vec![0xAB_u8; buf_size];
@@ -159,13 +155,7 @@ fn bench_download_throughput(c: &mut Criterion) {
 
                         // Send Settings + SYN with correct padding md5
                         let settings = format!("v=2\npadding-md5={}", md5_clone);
-                        write_frame(
-                            &mut tls,
-                            Command::Settings,
-                            0,
-                            settings.as_bytes(),
-                        )
-                        .await;
+                        write_frame(&mut tls, Command::Settings, 0, settings.as_bytes()).await;
                         write_frame(&mut tls, Command::Syn, 1, &[]).await;
                         tls.flush().await.unwrap();
 
