@@ -108,6 +108,10 @@ name = "padding_clone_bench"
 harness = false
 
 [[bench]]
+name = "download_throughput_bench"
+harness = false
+
+[[bench]]
 name = "channel_pressure_bench"
 harness = false
 
