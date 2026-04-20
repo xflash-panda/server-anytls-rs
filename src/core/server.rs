@@ -93,15 +93,12 @@ impl Server {
                         }
                     };
                     let _ = tcp_stream.set_nodelay(true);
-                    let permit = self.semaphore.clone().acquire_owned().await;
-                    let Ok(permit) = permit else { continue; };
                     let server = self.clone();
                     tokio::spawn(async move {
                         tracing::debug!("new connection from {}", peer_addr);
                         if let Err(e) = crate::handler::handle_connection(server, tcp_stream, peer_addr).await {
                             tracing::debug!("connection from {} ended: {}", peer_addr, e);
                         }
-                        drop(permit);
                     });
                 }
             }

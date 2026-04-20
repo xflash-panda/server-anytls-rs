@@ -81,6 +81,14 @@ pub(crate) async fn handle_connection(
     .await
     .map_err(|_| Error::HandshakeTimeout)??;
 
+    // Acquire connection permit after handshake + auth (not before) so the
+    // accept loop is never blocked when max_connections is reached. This lets
+    // new connections complete TLS handshake quickly even under load.
+    let permit = server.semaphore.clone().acquire_owned().await;
+    let Ok(_permit) = permit else {
+        return Err(Error::MaxConnectionsExceeded);
+    };
+
     // Register connection after successful authentication
     let (conn_id, cancel_token) = server.connection_manager.register(user_id, peer_addr);
     // Ensure unregister on exit (even on panic)
