@@ -151,7 +151,7 @@ impl CliArgs {
 pub struct AnyTlsConfig {
     pub server_port: u16,
     #[serde(default)]
-    pub padding_rules: Option<Vec<String>>,
+    pub padding_rules: Option<String>,
 }
 
 pub fn parse_anytls_config(node_config: panel_core::NodeConfigEnum) -> Result<AnyTlsConfig> {
@@ -297,12 +297,15 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_anytls_config_with_padding() {
-        let json = r#"{"server_port": 443, "padding_rules": ["rule1", "rule2"]}"#;
+    fn test_parse_anytls_config_with_padding_rules_string() {
+        // Real panel response: padding_rules is a string with \r\n separators, not an array
+        let json = r#"{"server_port":4430,"padding_rules":"stop=5\r\n0=30-30\r\n1=100-300\r\n2=300-500,c,500-1000,c,500-1000,c,500-1000\r\n3=500-1000\r\n4=500-1000"}"#;
         let config =
             parse_anytls_config(panel_core::NodeConfigEnum::AnyTls(json.to_string())).unwrap();
-        assert_eq!(config.server_port, 443);
-        assert_eq!(config.padding_rules.unwrap().len(), 2);
+        assert_eq!(config.server_port, 4430);
+        let rules = config.padding_rules.unwrap();
+        assert!(rules.contains("stop=5"));
+        assert!(rules.contains("0=30-30"));
     }
 
     #[test]
