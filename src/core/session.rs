@@ -96,34 +96,39 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
         let mut streams: FxHashMap<u32, mpsc::Sender<Bytes>> = FxHashMap::default();
         let mut settings_received = false;
 
-        // Create the write command channel and spawn writer task
+        // Create the write command channel and spawn writer task.
+        // The writer_cancel token lets the writer signal recv_loop to exit
+        // when a write error occurs (e.g. network disruption).
         let (write_cmd_tx, mut write_cmd_rx) =
             mpsc::channel::<WriteCommand>(self.config.write_cmd_capacity);
         let writer = self.write_half.clone();
+        let writer_failed = CancellationToken::new();
+        let writer_failed_signal = writer_failed.clone();
         tokio::spawn(async move {
             // Reusable buffer for coalescing header+payload into single writes.
             let mut combined_buf = Vec::with_capacity(HEADER_SIZE + u16::MAX as usize);
-            while let Some(cmd) = write_cmd_rx.recv().await {
+            let err = 'outer: loop {
+                let Some(cmd) = write_cmd_rx.recv().await else {
+                    break None;
+                };
                 let mut w = writer.lock().await;
-                if write_psh_frames(&mut *w, &cmd, &mut combined_buf)
-                    .await
-                    .is_err()
-                {
-                    return;
+                if let Err(e) = write_psh_frames(&mut *w, &cmd, &mut combined_buf).await {
+                    break Some(e);
                 }
                 // Drain all pending commands without blocking (batch writes)
                 while let Ok(cmd) = write_cmd_rx.try_recv() {
-                    if write_psh_frames(&mut *w, &cmd, &mut combined_buf)
-                        .await
-                        .is_err()
-                    {
-                        return;
+                    if let Err(e) = write_psh_frames(&mut *w, &cmd, &mut combined_buf).await {
+                        break 'outer Some(e);
                     }
                 }
                 // Single flush for entire batch
-                if w.flush().await.is_err() {
-                    return;
+                if let Err(e) = w.flush().await {
+                    break Some(e);
                 }
+            };
+            if let Some(e) = err {
+                warn!("writer task: write error: {}", e);
+                writer_failed_signal.cancel();
             }
         });
 
@@ -171,6 +176,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                 }
                 _ = cancel_token.cancelled() => {
                     debug!("session cancelled by connection manager");
+                    break;
+                }
+                _ = writer_failed.cancelled() => {
+                    debug!("writer task failed, closing session");
                     break;
                 }
             };
@@ -1175,6 +1184,149 @@ mod tests {
         assert!(
             result.is_ok(),
             "session did not terminate after keepalive stopped"
+        );
+    }
+
+    /// When the writer task encounters a write error (e.g. network disruption),
+    /// recv_loop must detect this and exit promptly. Otherwise the session stays
+    /// "alive" on the read side while all streams can no longer send data back,
+    /// causing clients to see ERR_CONNECTION_CLOSED on all concurrent requests.
+    #[tokio::test]
+    async fn test_recv_loop_exits_when_writer_task_dies() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{Context, Poll};
+        use tokio::io::ReadBuf;
+
+        /// Wrapper that can independently fail writes while reads still work.
+        struct FailableWriter {
+            inner: tokio::io::DuplexStream,
+            fail_writes: Arc<AtomicBool>,
+        }
+
+        impl AsyncRead for FailableWriter {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+            }
+        }
+
+        impl AsyncWrite for FailableWriter {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                let this = self.get_mut();
+                if this.fail_writes.load(Ordering::Relaxed) {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "simulated write failure",
+                    )));
+                }
+                std::pin::Pin::new(&mut this.inner).poll_write(cx, buf)
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                let this = self.get_mut();
+                if this.fail_writes.load(Ordering::Relaxed) {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "simulated flush failure",
+                    )));
+                }
+                std::pin::Pin::new(&mut this.inner).poll_flush(cx)
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+            }
+        }
+
+        let (mut client_io, server_io) = duplex(65536);
+        let fail_writes = Arc::new(AtomicBool::new(false));
+        let failable = FailableWriter {
+            inner: server_io,
+            fail_writes: fail_writes.clone(),
+        };
+        let padding = test_padding();
+        let session = Arc::new(Session::new_server(
+            failable,
+            padding,
+            SessionConfig::default(),
+        ));
+        let settings_data = format!("v=2\npadding-md5={}", session.padding_md5());
+        write_frame(
+            &mut client_io,
+            Command::Settings,
+            0,
+            settings_data.as_bytes(),
+        )
+        .await;
+
+        // Create a stream so writer task is active
+        write_frame(&mut client_io, Command::Syn, 1, &[]).await;
+
+        let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
+        let sess = session.clone();
+        let handle = tokio::spawn(async move {
+            sess.recv_loop(
+                new_stream_tx,
+                Some(std::time::Duration::from_secs(300)), // long idle timeout
+                None,
+                CancellationToken::new(),
+            )
+            .await
+        });
+
+        let mut stream =
+            tokio::time::timeout(std::time::Duration::from_secs(1), new_stream_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+
+        // Stream can write initially
+        use tokio::io::AsyncWriteExt;
+        stream.write_all(b"hello").await.unwrap();
+
+        // Now fail all writes — simulates network disruption on write path
+        fail_writes.store(true, Ordering::Relaxed);
+
+        // Trigger writer task to encounter the error
+        // (may need a few attempts since writer might not pick up immediately)
+        for _ in 0..10 {
+            let _ = stream.write_all(b"trigger failure").await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Keep client sending PSH data — this does NOT cause recv_loop to
+        // write anything (it just dispatches to the stream channel).
+        // This keeps recv_loop alive on the read side.
+        let keepalive_task = tokio::spawn(async move {
+            loop {
+                write_frame(&mut client_io, Command::Psh, 1, b"keep alive").await;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+
+        // recv_loop should exit within 2 seconds after writer dies.
+        // Currently it will hang because writer dies silently and
+        // PSH handling doesn't require any writes.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        keepalive_task.abort();
+
+        assert!(
+            result.is_ok(),
+            "recv_loop did not exit after writer task died — \
+             session stays half-alive, causing all streams to hang"
         );
     }
 
