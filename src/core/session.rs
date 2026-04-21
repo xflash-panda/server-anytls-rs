@@ -48,6 +48,30 @@ async fn write_psh_frames<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
+/// Write a single WriteCommand: PSH data frames, then optionally a FIN frame.
+/// Routing FIN through the same writer task as PSH guarantees FIN is never
+/// sent before all preceding PSH data for that stream.
+async fn write_cmd_frame<W: AsyncWriteExt + Unpin>(
+    w: &mut W,
+    cmd: &WriteCommand,
+    combined_buf: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    if !cmd.data.is_empty() {
+        write_psh_frames(w, cmd, combined_buf).await?;
+    }
+    if cmd.fin {
+        let header = FrameHeader {
+            command: Command::Fin,
+            stream_id: cmd.stream_id,
+            length: 0,
+        };
+        let mut hdr_buf = [0u8; HEADER_SIZE];
+        header.encode(&mut hdr_buf);
+        w.write_all(&hdr_buf).await?;
+    }
+    Ok(())
+}
+
 pub const DEFAULT_WRITE_BUF_SIZE: usize = 32 * 1024;
 pub const DEFAULT_STREAM_CHANNEL_CAPACITY: usize = 128;
 
@@ -108,34 +132,39 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
         let mut streams: FxHashMap<u32, mpsc::Sender<Bytes>> = FxHashMap::default();
         let mut settings_received = false;
 
-        // Create the write command channel and spawn writer task
+        // Create the write command channel and spawn writer task.
+        // The writer_cancel token lets the writer signal recv_loop to exit
+        // when a write error occurs (e.g. network disruption).
         let (write_cmd_tx, mut write_cmd_rx) =
             mpsc::channel::<WriteCommand>(self.config.write_cmd_capacity);
         let writer = self.write_half.clone();
+        let writer_failed = CancellationToken::new();
+        let writer_failed_signal = writer_failed.clone();
         tokio::spawn(async move {
             // Reusable buffer for coalescing header+payload into single writes.
             let mut combined_buf = Vec::with_capacity(HEADER_SIZE + u16::MAX as usize);
-            while let Some(cmd) = write_cmd_rx.recv().await {
+            let err = 'outer: loop {
+                let Some(cmd) = write_cmd_rx.recv().await else {
+                    break None;
+                };
                 let mut w = writer.lock().await;
-                if write_psh_frames(&mut *w, &cmd, &mut combined_buf)
-                    .await
-                    .is_err()
-                {
-                    return;
+                if let Err(e) = write_cmd_frame(&mut *w, &cmd, &mut combined_buf).await {
+                    break Some(e);
                 }
                 // Drain all pending commands without blocking (batch writes)
                 while let Ok(cmd) = write_cmd_rx.try_recv() {
-                    if write_psh_frames(&mut *w, &cmd, &mut combined_buf)
-                        .await
-                        .is_err()
-                    {
-                        return;
+                    if let Err(e) = write_cmd_frame(&mut *w, &cmd, &mut combined_buf).await {
+                        break 'outer Some(e);
                     }
                 }
                 // Single flush for entire batch
-                if w.flush().await.is_err() {
-                    return;
+                if let Err(e) = w.flush().await {
+                    break Some(e);
                 }
+            };
+            if let Some(e) = err {
+                warn!("writer task: write error: {}", e);
+                writer_failed_signal.cancel();
             }
         });
 
@@ -183,6 +212,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                 }
                 _ = cancel_token.cancelled() => {
                     debug!("session cancelled by connection manager");
+                    break;
+                }
+                _ = writer_failed.cancelled() => {
+                    debug!("writer task failed, closing session");
                     break;
                 }
             };
@@ -972,6 +1005,128 @@ mod tests {
         );
 
         drain.abort();
+        let _ = handle.await;
+    }
+
+    /// RED test: Prove that send_fin can arrive before pending PSH data.
+    ///
+    /// Scenario: a stream writes many PSH chunks through write_cmd_tx (writer task),
+    /// then immediately calls session.send_fin() which bypasses the writer task
+    /// and writes FIN directly to the TLS connection via write_half mutex.
+    /// Under contention, FIN can win the lock race and arrive before the
+    /// writer task has flushed all PSH data — causing ERR_CONNECTION_CLOSED.
+    #[tokio::test]
+    async fn test_fin_must_arrive_after_all_psh_data() {
+        let (mut client_io, server_io) = duplex(2 * 1024 * 1024);
+        let padding = test_padding();
+        let session = Arc::new(Session::new_server(
+            server_io,
+            padding,
+            SessionConfig::default(),
+        ));
+        let settings_data = format!("v=2\npadding-md5={}", session.padding_md5());
+        write_frame(
+            &mut client_io,
+            Command::Settings,
+            0,
+            settings_data.as_bytes(),
+        )
+        .await;
+        write_frame(&mut client_io, Command::Syn, 1, &[]).await;
+
+        let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
+        let sess = session.clone();
+        let handle = tokio::spawn(async move {
+            sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
+                .await
+        });
+
+        let mut stream =
+            tokio::time::timeout(std::time::Duration::from_secs(1), new_stream_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(stream.id(), 1);
+
+        // Write many PSH chunks through the stream (goes via write_cmd_tx → writer task).
+        // Use large enough volume that the writer task can't flush instantly.
+        {
+            use tokio::io::AsyncWriteExt;
+            let data = vec![0xBE_u8; 4096];
+            for _ in 0..50 {
+                stream.write_all(&data).await.unwrap();
+            }
+        }
+
+        // Send FIN through the same writer task channel — guarantees ordering
+        // after all PSH data. (The old code used session.send_fin() which
+        // bypassed the channel and raced with the writer task.)
+        stream.send_fin().await.unwrap();
+
+        // Read all frames from client side and verify:
+        // ALL PSH frames for stream 1 must appear BEFORE the FIN.
+        let mut hdr_buf = [0u8; HEADER_SIZE];
+        let mut skip_buf = vec![0u8; 65536];
+        let mut total_psh_bytes: usize = 0;
+        let mut fin_seen = false;
+        let mut psh_after_fin = false;
+
+        let read_result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if client_io.read_exact(&mut hdr_buf).await.is_err() {
+                    break;
+                }
+                let hdr = FrameHeader::decode(&hdr_buf);
+                if hdr.length > 0 {
+                    if client_io
+                        .read_exact(&mut skip_buf[..hdr.length as usize])
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                if hdr.stream_id == 1 {
+                    match hdr.command {
+                        Command::Psh => {
+                            total_psh_bytes += hdr.length as usize;
+                            if fin_seen {
+                                psh_after_fin = true;
+                            }
+                        }
+                        Command::Fin => {
+                            fin_seen = true;
+                        }
+                        _ => {}
+                    }
+                }
+                if fin_seen && !psh_after_fin {
+                    // FIN seen and no more PSH expected — we can stop reading
+                    // Give a small window to catch any late PSH frames
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(read_result.is_ok(), "timed out reading frames");
+
+        let expected_psh_bytes = 50 * 4096;
+        assert!(
+            fin_seen,
+            "FIN frame not received"
+        );
+        assert!(
+            !psh_after_fin,
+            "BUG: PSH data arrived AFTER FIN — client would see ERR_CONNECTION_CLOSED. \
+             Got {total_psh_bytes}/{expected_psh_bytes} PSH bytes before FIN."
+        );
+        assert_eq!(
+            total_psh_bytes, expected_psh_bytes,
+            "Not all PSH data arrived before FIN — {total_psh_bytes}/{expected_psh_bytes} bytes. \
+             Missing data means the client sees a truncated response (ERR_CONNECTION_CLOSED)."
+        );
+
+        drop(client_io);
         let _ = handle.await;
     }
 
