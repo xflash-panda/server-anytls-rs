@@ -105,12 +105,28 @@ impl Server {
                     };
                     let _ = tcp_stream.set_nodelay(true);
                     set_tcp_keepalive(&tcp_stream);
+
+                    // Acquire connection permit before spawning — blocks accept
+                    // loop when max_connections is reached, queuing new connections
+                    // in the kernel TCP backlog instead of exceeding the limit.
+                    // Race against shutdown so we remain responsive to cancellation.
+                    let permit = tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        permit = self.semaphore.clone().acquire_owned() => {
+                            match permit {
+                                Ok(p) => p,
+                                Err(_) => break,
+                            }
+                        }
+                    };
+
                     let server = self.clone();
                     tokio::spawn(async move {
                         tracing::debug!("new connection from {}", peer_addr);
                         if let Err(e) = crate::handler::handle_connection(server, tcp_stream, peer_addr).await {
                             tracing::debug!("connection from {} ended: {}", peer_addr, e);
                         }
+                        drop(permit);
                     });
                 }
             }
