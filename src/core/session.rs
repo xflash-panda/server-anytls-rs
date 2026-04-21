@@ -200,10 +200,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                 }
                 Err(e) => return Err(e.into()),
             }
-            // Reset idle timer on every received frame.
-            if let Some(d) = idle_timeout {
-                idle_sleep.as_mut().reset(tokio::time::Instant::now() + d);
-            }
             // Reset keepalive timer on activity — only send keepalives when idle.
             if let Some(d) = keepalive_interval {
                 keepalive_sleep
@@ -214,6 +210,18 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             }
 
             let header = FrameHeader::decode(&hdr_buf);
+
+            // Reset idle timer only on data frames (not heartbeat frames).
+            // This ensures connections without real traffic will eventually
+            // time out, matching the Go server behavior.
+            if let Some(d) = idle_timeout {
+                if !matches!(
+                    header.command,
+                    Command::HeartRequest | Command::HeartResponse
+                ) {
+                    idle_sleep.as_mut().reset(tokio::time::Instant::now() + d);
+                }
+            }
             let len = header.length as usize;
 
             match header.command {
@@ -863,14 +871,15 @@ mod tests {
             .await
         });
 
-        // Send HeartRequest every 100ms for 500ms (well past the 200ms timeout).
+        // Send Waste frames every 100ms for 500ms (well past the 200ms timeout).
+        // Only data frames reset idle timeout; heartbeat frames do not.
         for _ in 0..5 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            write_frame(&mut client_io, Command::HeartRequest, 0, &[]).await;
+            write_frame(&mut client_io, Command::Waste, 0, &[]).await;
         }
 
         // Session should still be alive — the idle timer should have been
-        // reset by each received frame.
+        // reset by each data frame.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
             !handle.is_finished(),
@@ -1124,10 +1133,10 @@ mod tests {
         let _ = handle.await;
     }
 
-    /// Server keepalive HeartRequest should reset the idle timer (because
-    /// client responds with HeartResponse), preventing false idle timeouts.
+    /// Heartbeat frames should NOT reset the idle timer — connections without
+    /// real data traffic should still idle-timeout even if keepalive succeeds.
     #[tokio::test]
-    async fn test_keepalive_prevents_idle_timeout() {
+    async fn test_keepalive_does_not_prevent_idle_timeout() {
         let (mut client_io, server_io) = duplex(65536);
         let padding = test_padding();
         let session = Arc::new(Session::new_server(
@@ -1179,21 +1188,15 @@ mod tests {
             }
         });
 
-        // Wait 500ms — well past the 200ms idle timeout.
-        // If keepalive works, session should still be alive.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        assert!(
-            !handle.is_finished(),
-            "session terminated despite keepalive — idle timeout not reset by HeartResponse"
-        );
-
-        respond_task.abort();
-        // After aborting the responder, session should idle-timeout within ~200ms
+        // Heartbeat frames do NOT reset idle timeout, so despite keepalive
+        // succeeding, the session should still idle-timeout after 200ms.
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
         assert!(
             result.is_ok(),
-            "session did not terminate after keepalive stopped"
+            "session did not terminate — idle timeout should fire even with keepalive"
         );
+
+        respond_task.abort();
     }
 
     /// When the writer task encounters a write error (e.g. network disruption),
