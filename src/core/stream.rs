@@ -6,15 +6,41 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use tokio_util::sync::PollSender;
 
+/// Handle for sending a FIN frame through the writer task channel.
+/// Extracted from a `Stream` before it is consumed (e.g. by `tokio::io::split`).
+pub struct FinSender {
+    stream_id: u32,
+    tx: mpsc::Sender<WriteCommand>,
+}
+
+impl FinSender {
+    pub async fn send_fin(&self) -> io::Result<()> {
+        let cmd = WriteCommand {
+            stream_id: self.stream_id,
+            data: Bytes::new(),
+            fin: true,
+        };
+        self.tx
+            .send(cmd)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "session closed"))
+    }
+}
+
 pub struct WriteCommand {
     pub stream_id: u32,
     pub data: Bytes,
+    /// When true, the writer task emits a FIN frame after any data.
+    /// Routing FIN through the same channel as PSH guarantees ordering.
+    pub fin: bool,
 }
 
 pub struct Stream {
     id: u32,
     data_rx: mpsc::Receiver<Bytes>,
     session_tx: PollSender<WriteCommand>,
+    /// Raw sender kept for `send_fin()` — works even after `tokio::io::split`.
+    fin_tx: mpsc::Sender<WriteCommand>,
     read_buf: Bytes,
 }
 
@@ -28,6 +54,7 @@ impl Stream {
         let stream = Self {
             id,
             data_rx,
+            fin_tx: session_tx.clone(),
             session_tx: PollSender::new(session_tx),
             read_buf: Bytes::new(),
         };
@@ -36,6 +63,22 @@ impl Stream {
 
     pub fn id(&self) -> u32 {
         self.id
+    }
+
+    /// Returns a sender that can enqueue a FIN for this stream through the
+    /// writer task channel. Useful when the Stream will be consumed (e.g. by
+    /// `tokio::io::split`) and `send_fin()` cannot be called directly.
+    pub fn fin_sender(&self) -> FinSender {
+        FinSender {
+            stream_id: self.id,
+            tx: self.fin_tx.clone(),
+        }
+    }
+
+    /// Send a FIN frame through the writer task channel, guaranteeing it is
+    /// ordered after all previously queued PSH data for this stream.
+    pub async fn send_fin(&self) -> io::Result<()> {
+        self.fin_sender().send_fin().await
     }
 }
 
@@ -84,7 +127,11 @@ impl AsyncWrite for Stream {
                 let data = Bytes::copy_from_slice(buf);
                 let len = data.len();
                 self.session_tx
-                    .send_item(WriteCommand { stream_id, data })
+                    .send_item(WriteCommand {
+                        stream_id,
+                        data,
+                        fin: false,
+                    })
                     .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "session closed"))?;
                 Poll::Ready(Ok(len))
             }
