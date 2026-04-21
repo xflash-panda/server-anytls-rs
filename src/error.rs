@@ -23,9 +23,6 @@ pub enum Error {
     #[error("max streams exceeded")]
     MaxStreamsExceeded,
 
-    #[error("max connections exceeded")]
-    MaxConnectionsExceeded,
-
     #[error("handshake timeout")]
     HandshakeTimeout,
 
