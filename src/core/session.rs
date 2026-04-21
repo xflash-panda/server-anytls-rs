@@ -214,13 +214,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             // Reset idle timer only on data frames (not heartbeat frames).
             // This ensures connections without real traffic will eventually
             // time out, matching the Go server behavior.
-            if let Some(d) = idle_timeout {
-                if !matches!(
+            if let Some(d) = idle_timeout
+                && !matches!(
                     header.command,
                     Command::HeartRequest | Command::HeartResponse
-                ) {
-                    idle_sleep.as_mut().reset(tokio::time::Instant::now() + d);
-                }
+                )
+            {
+                idle_sleep.as_mut().reset(tokio::time::Instant::now() + d);
             }
             let len = header.length as usize;
 
