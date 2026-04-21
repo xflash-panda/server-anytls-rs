@@ -105,6 +105,8 @@ async fn main() -> Result<()> {
         .tls_config(tls_config)
         .connection_manager(connection_manager.clone())
         .max_connections(cli.max_connections)
+        .write_buf_size(cli.write_buf_size)
+        .stream_channel_capacity(cli.stream_channel_capacity)
         .keepalive_interval(keepalive);
 
     if let Some(ref rules) = remote_config.padding_rules
