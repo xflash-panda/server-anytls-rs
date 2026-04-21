@@ -1111,10 +1111,7 @@ mod tests {
         assert!(read_result.is_ok(), "timed out reading frames");
 
         let expected_psh_bytes = 50 * 4096;
-        assert!(
-            fin_seen,
-            "FIN frame not received"
-        );
+        assert!(fin_seen, "FIN frame not received");
         assert!(
             !psh_after_fin,
             "BUG: PSH data arrived AFTER FIN — client would see ERR_CONNECTION_CLOSED. \
