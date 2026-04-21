@@ -9,7 +9,9 @@ use crate::core::connection::ConnectionManager;
 
 use crate::core::hooks::{Authenticator, NoopStatsCollector, OutboundRouter, StatsCollector};
 use crate::core::padding::{DEFAULT_SCHEME, PaddingFactory};
-use crate::core::session::SessionConfig;
+use crate::core::session::{
+    DEFAULT_STREAM_CHANNEL_CAPACITY, DEFAULT_WRITE_BUF_SIZE, SessionConfig,
+};
 
 /// Enable TCP keepalive on an accepted connection to match Go's default
 /// behavior (SO_KEEPALIVE + 30s interval). Without this, dead connections
@@ -36,6 +38,10 @@ pub struct ServerConfig {
     /// HeartRequest frames at this interval to prevent NAT devices from
     /// dropping idle connections.
     pub keepalive_interval: Option<Duration>,
+    /// BufWriter buffer size for the TLS write half (bytes).
+    pub write_buf_size: usize,
+    /// Per-stream data channel capacity (number of buffered messages).
+    pub stream_channel_capacity: usize,
 }
 
 impl Default for ServerConfig {
@@ -47,6 +53,8 @@ impl Default for ServerConfig {
             idle_timeout: Duration::from_secs(300),
             handshake_timeout: Duration::from_secs(10),
             keepalive_interval: Some(Duration::from_secs(30)),
+            write_buf_size: DEFAULT_WRITE_BUF_SIZE,
+            stream_channel_capacity: DEFAULT_STREAM_CHANNEL_CAPACITY,
         }
     }
 }
@@ -78,6 +86,8 @@ impl Server {
     pub fn session_config(&self) -> SessionConfig {
         SessionConfig {
             max_streams: self.config.max_streams_per_session,
+            write_buf_size: self.config.write_buf_size,
+            stream_channel_capacity: self.config.stream_channel_capacity,
             ..SessionConfig::default()
         }
     }
@@ -152,6 +162,8 @@ pub struct ServerBuilder {
     idle_timeout: Duration,
     handshake_timeout: Duration,
     keepalive_interval: Option<Duration>,
+    write_buf_size: usize,
+    stream_channel_capacity: usize,
 }
 
 impl ServerBuilder {
@@ -170,6 +182,8 @@ impl ServerBuilder {
             idle_timeout: defaults.idle_timeout,
             handshake_timeout: defaults.handshake_timeout,
             keepalive_interval: defaults.keepalive_interval,
+            write_buf_size: defaults.write_buf_size,
+            stream_channel_capacity: defaults.stream_channel_capacity,
         }
     }
 
@@ -233,6 +247,16 @@ impl ServerBuilder {
         self
     }
 
+    pub fn write_buf_size(mut self, n: usize) -> Self {
+        self.write_buf_size = n;
+        self
+    }
+
+    pub fn stream_channel_capacity(mut self, n: usize) -> Self {
+        self.stream_channel_capacity = n;
+        self
+    }
+
     pub fn build(self) -> anyhow::Result<Server> {
         let authenticator = self
             .authenticator
@@ -256,6 +280,8 @@ impl ServerBuilder {
             idle_timeout: self.idle_timeout,
             handshake_timeout: self.handshake_timeout,
             keepalive_interval: self.keepalive_interval,
+            write_buf_size: self.write_buf_size,
+            stream_channel_capacity: self.stream_channel_capacity,
         };
 
         let semaphore = Arc::new(Semaphore::new(config.max_connections));

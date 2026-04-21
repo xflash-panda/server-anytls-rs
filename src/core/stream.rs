@@ -6,8 +6,6 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use tokio_util::sync::PollSender;
 
-const CHANNEL_CAPACITY: usize = 1024;
-
 pub struct WriteCommand {
     pub stream_id: u32,
     pub data: Bytes,
@@ -21,8 +19,12 @@ pub struct Stream {
 }
 
 impl Stream {
-    pub fn new(id: u32, session_tx: mpsc::Sender<WriteCommand>) -> (mpsc::Sender<Bytes>, Self) {
-        let (data_tx, data_rx) = mpsc::channel(CHANNEL_CAPACITY);
+    pub fn new(
+        id: u32,
+        session_tx: mpsc::Sender<WriteCommand>,
+        channel_capacity: usize,
+    ) -> (mpsc::Sender<Bytes>, Self) {
+        let (data_tx, data_rx) = mpsc::channel(channel_capacity);
         let stream = Self {
             id,
             data_rx,
@@ -110,7 +112,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_read_receives_data() {
-        let (writer, mut stream) = Stream::new(1, dummy_writer());
+        let (writer, mut stream) = Stream::new(1, dummy_writer(), 128);
         writer
             .send(bytes::Bytes::from_static(b"hello"))
             .await
@@ -122,7 +124,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_read_eof_on_drop() {
-        let (writer, mut stream) = Stream::new(1, dummy_writer());
+        let (writer, mut stream) = Stream::new(1, dummy_writer(), 128);
         drop(writer);
         let mut buf = [0u8; 16];
         let n = stream.read(&mut buf).await.unwrap();
@@ -131,7 +133,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_read_partial_buffer() {
-        let (writer, mut stream) = Stream::new(1, dummy_writer());
+        let (writer, mut stream) = Stream::new(1, dummy_writer(), 128);
         writer
             .send(bytes::Bytes::from_static(b"hello world"))
             .await
@@ -147,7 +149,7 @@ mod tests {
     #[tokio::test]
     async fn test_stream_write_sends_frame() {
         let (session_writer, mut rx) = tokio::sync::mpsc::channel::<WriteCommand>(8);
-        let (_data_tx, mut stream) = Stream::new(1, session_writer);
+        let (_data_tx, mut stream) = Stream::new(1, session_writer, 128);
         stream.write_all(b"hello").await.unwrap();
         let cmd = rx.recv().await.unwrap();
         assert_eq!(cmd.stream_id, 1);
@@ -156,8 +158,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_id() {
-        let (_writer, stream) = Stream::new(42, dummy_writer());
+        let (_writer, stream) = Stream::new(42, dummy_writer(), 128);
         assert_eq!(stream.id(), 42);
+    }
+
+    /// Stream::new should accept a configurable channel capacity parameter.
+    #[tokio::test]
+    async fn test_stream_new_with_custom_capacity() {
+        let (writer, mut stream) = Stream::new(1, dummy_writer(), 16);
+        writer
+            .send(bytes::Bytes::from_static(b"hello"))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 16];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello");
     }
 
     fn dummy_writer() -> tokio::sync::mpsc::Sender<WriteCommand> {
