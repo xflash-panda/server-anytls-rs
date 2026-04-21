@@ -195,7 +195,7 @@ async fn proxy_tcp<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     };
 
     session.handshake_success(stream_id).await?;
-    relay_and_record(server, session, stream, remote, trailing, user_id).await
+    relay_and_record(server, stream, remote, trailing, user_id).await
 }
 
 /// Connect via an ACL outbound handler (Socks5, Http, etc.) and relay data.
@@ -239,25 +239,21 @@ async fn proxy_tcp_via_handler<T: AsyncRead + AsyncWrite + Unpin + Send + 'stati
     };
 
     session.handshake_success(stream_id).await?;
-    relay_and_record(server, session, stream, remote, trailing, user_id).await
+    relay_and_record(server, stream, remote, trailing, user_id).await
 }
 
 /// Bidirectional relay between client stream and remote, with byte counting and
 /// traffic stats recording. Handles trailing data forwarding and FIN signaling.
-async fn relay_and_record<T, R>(
+async fn relay_and_record<R>(
     server: Arc<Server>,
-    session: Arc<Session<T>>,
     stream: Stream,
     mut remote: R,
     trailing: Vec<u8>,
     user_id: UserId,
 ) -> Result<()>
 where
-    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     R: AsyncRead + AsyncWrite + Unpin,
 {
-    let stream_id = stream.id();
-
     // Forward any application data that was read alongside the SOCKS address.
     let trailing_len = trailing.len() as u64;
     if !trailing.is_empty() {
@@ -295,7 +291,9 @@ where
         server.stats.record_download(user_id, down);
     }
 
-    session.send_fin(stream_id).await?;
+    // Send FIN through the writer task channel (not directly via write_half)
+    // to guarantee it arrives after all queued PSH data for this stream.
+    counted_stream.inner.send_fin().await?;
 
     Ok(())
 }

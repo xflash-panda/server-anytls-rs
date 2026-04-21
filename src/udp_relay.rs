@@ -245,6 +245,9 @@ pub(crate) async fn handle_udp_over_tcp<T: AsyncRead + AsyncWrite + Unpin + Send
     // Signal handshake success to the client.
     session.handshake_success(stream_id).await?;
 
+    // Grab a FIN sender before splitting — split consumes the Stream.
+    let fin_sender = stream.fin_sender();
+
     // Split the stream for concurrent read/write.
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = PrefixedReader::new(remaining, read_half);
@@ -326,7 +329,9 @@ pub(crate) async fn handle_udp_over_tcp<T: AsyncRead + AsyncWrite + Unpin + Send
         server.stats.record_download(user_id, down);
     }
 
-    session.send_fin(stream_id).await?;
+    // Send FIN through the writer task channel (not directly via write_half)
+    // to guarantee it arrives after all queued PSH data for this stream.
+    fin_sender.send_fin().await?;
     Ok(())
 }
 
