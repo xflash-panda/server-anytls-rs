@@ -74,11 +74,31 @@ pub struct CliArgs {
     #[arg(long, env = "X_PANDA_ANYTLS_BLOCK_PRIVATE_IP", default_value_t = true)]
     pub block_private_ip: bool,
 
-    #[arg(long, env = "X_PANDA_ANYTLS_MAX_CONNECTIONS", default_value_t = 10000)]
-    pub max_connections: usize,
-
     #[arg(long, env = "X_PANDA_ANYTLS_REFRESH_GEODATA", default_value_t = false)]
     pub refresh_geodata: bool,
+
+    // --- Performance tuning ---
+    /// Maximum number of concurrent connections.
+    #[arg(
+        long,
+        env = "X_PANDA_ANYTLS_MAX_CONNECTIONS",
+        default_value_t = 10000,
+        help_heading = "Performance"
+    )]
+    pub max_connections: usize,
+
+    /// BufWriter buffer size for the TLS write half (bytes).
+    #[arg(long, env = "X_PANDA_ANYTLS_WRITE_BUF_SIZE", default_value_t = 32 * 1024, help_heading = "Performance")]
+    pub write_buf_size: usize,
+
+    /// Per-stream data channel capacity (number of buffered messages).
+    #[arg(
+        long,
+        env = "X_PANDA_ANYTLS_STREAM_CHANNEL_CAPACITY",
+        default_value_t = 128,
+        help_heading = "Performance"
+    )]
+    pub stream_channel_capacity: usize,
 }
 
 impl CliArgs {
@@ -168,6 +188,8 @@ mod tests {
             block_private_ip: true,
             max_connections: 10000,
             refresh_geodata: false,
+            write_buf_size: 32 * 1024,
+            stream_channel_capacity: 128,
         }
     }
 
@@ -260,5 +282,12 @@ mod tests {
         let json = r#"{"server_port": 443}"#;
         let config = parse_anytls_config(panel_core::NodeConfigEnum::Trojan(json.to_string()));
         assert!(config.is_err());
+    }
+
+    #[test]
+    fn test_cli_args_performance_defaults() {
+        let cli = create_test_cli_args();
+        assert_eq!(cli.write_buf_size, 32 * 1024);
+        assert_eq!(cli.stream_channel_capacity, 128);
     }
 }

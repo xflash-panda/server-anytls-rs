@@ -479,7 +479,7 @@ mod tests {
 
         let (write_cmd_tx, mut write_cmd_rx) = tokio::sync::mpsc::channel::<WriteCommand>(256);
         tokio::spawn(async move { while write_cmd_rx.recv().await.is_some() {} });
-        let (data_tx, stream) = Stream::new(1, write_cmd_tx);
+        let (data_tx, stream) = Stream::new(1, write_cmd_tx, 128);
 
         // SOCKS5 IPv4 address pointing to our RST server + trailing payload
         let ip = match echo_addr {
@@ -553,7 +553,7 @@ mod tests {
         // Drain write commands from the session writer
         let (write_cmd_tx, mut write_cmd_rx) = tokio::sync::mpsc::channel::<WriteCommand>(256);
         tokio::spawn(async move { while write_cmd_rx.recv().await.is_some() {} });
-        let (data_tx, stream) = Stream::new(1, write_cmd_tx);
+        let (data_tx, stream) = Stream::new(1, write_cmd_tx, 128);
 
         // SOCKS5 IPv4 address pointing to echo server (no trailing data)
         let ip = match echo_addr {

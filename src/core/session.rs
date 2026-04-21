@@ -48,9 +48,16 @@ async fn write_psh_frames<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
+pub const DEFAULT_WRITE_BUF_SIZE: usize = 32 * 1024;
+pub const DEFAULT_STREAM_CHANNEL_CAPACITY: usize = 128;
+
 pub struct SessionConfig {
     pub max_streams: usize,
     pub write_cmd_capacity: usize,
+    /// BufWriter buffer size for the TLS write half (bytes).
+    pub write_buf_size: usize,
+    /// Per-stream data channel capacity (number of Bytes messages).
+    pub stream_channel_capacity: usize,
 }
 
 impl Default for SessionConfig {
@@ -58,15 +65,11 @@ impl Default for SessionConfig {
         Self {
             max_streams: 256,
             write_cmd_capacity: 512,
+            write_buf_size: DEFAULT_WRITE_BUF_SIZE,
+            stream_channel_capacity: DEFAULT_STREAM_CHANNEL_CAPACITY,
         }
     }
 }
-
-/// BufWriter buffer size for the TLS write half.
-/// Coalesces multiple small writes into fewer, larger TLS records.
-/// Each TLS record has ~29 bytes overhead (header + MAC), so batching
-/// reduces per-record overhead and the number of TCP segments sent.
-const WRITE_BUF_SIZE: usize = 256 * 1024;
 
 pub struct Session<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> {
     read_half: Mutex<tokio::io::ReadHalf<T>>,
@@ -79,11 +82,11 @@ pub struct Session<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> {
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
     pub fn new_server(conn: T, padding: PaddingFactory, config: SessionConfig) -> Self {
         let (read_half, write_half) = tokio::io::split(conn);
+        let buf_size = config.write_buf_size;
         Self {
             read_half: Mutex::new(read_half),
             write_half: Arc::new(Mutex::new(tokio::io::BufWriter::with_capacity(
-                WRITE_BUF_SIZE,
-                write_half,
+                buf_size, write_half,
             ))),
             padding,
             config,
@@ -237,18 +240,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                         // Use try_send to avoid head-of-line blocking: if one
                         // stream's channel is full, we must not block recv_loop
                         // (which would stall ALL streams on this connection).
-                        // With channel capacity 1024, Full is extremely rare and
-                        // indicates the consumer is severely behind.
                         match tx.try_send(data) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Closed(_)) => {
                                 streams.remove(&header.stream_id);
                             }
                             Err(mpsc::error::TrySendError::Full(_)) => {
-                                // Channel full (capacity 1024) — consumer is
-                                // severely behind. Drop this stream immediately
-                                // to avoid blocking recv_loop (which would stall
-                                // ALL streams on this connection).
+                                // Channel full — consumer is severely behind.
+                                // Drop this stream to avoid blocking recv_loop
+                                // (which would stall ALL streams).
                                 let stream_id = header.stream_id;
                                 warn!(stream_id, "stream channel full, closing stream");
                                 streams.remove(&stream_id);
@@ -309,7 +309,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                         payload_buf.resize(len, 0);
                         reader.read_exact(&mut payload_buf[..len]).await?;
                     }
-                    let (data_tx, stream) = Stream::new(header.stream_id, write_cmd_tx.clone());
+                    let (data_tx, stream) = Stream::new(
+                        header.stream_id,
+                        write_cmd_tx.clone(),
+                        self.config.stream_channel_capacity,
+                    );
                     streams.insert(header.stream_id, data_tx);
                     if new_stream_tx.send(stream).await.is_err() {
                         warn!("new_stream_tx receiver dropped");
@@ -1401,6 +1405,65 @@ mod tests {
         );
         let n = result.unwrap().unwrap();
         assert_eq!(&buf[..n], b"hello stream 2");
+
+        drop(client_io);
+        let _ = handle.await;
+    }
+
+    /// SessionConfig should have a write_buf_size field that defaults to 32KB.
+    #[test]
+    fn test_session_config_write_buf_size_default() {
+        let config = SessionConfig::default();
+        assert_eq!(config.write_buf_size, 32 * 1024);
+    }
+
+    /// SessionConfig should have a stream_channel_capacity field that defaults to 128.
+    #[test]
+    fn test_session_config_stream_channel_capacity_default() {
+        let config = SessionConfig::default();
+        assert_eq!(config.stream_channel_capacity, 128);
+    }
+
+    /// Session should use the configured stream_channel_capacity when creating streams.
+    #[tokio::test]
+    async fn test_session_uses_configured_stream_channel_capacity() {
+        let (mut client_io, server_io) = duplex(65536);
+        let padding = test_padding();
+        let config = SessionConfig {
+            stream_channel_capacity: 16,
+            ..SessionConfig::default()
+        };
+        let session = Arc::new(Session::new_server(server_io, padding, config));
+        let settings_data = format!("v=2\npadding-md5={}", session.padding_md5());
+        write_frame(
+            &mut client_io,
+            Command::Settings,
+            0,
+            settings_data.as_bytes(),
+        )
+        .await;
+        write_frame(&mut client_io, Command::Syn, 1, &[]).await;
+
+        let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
+        let sess = session.clone();
+        let handle = tokio::spawn(async move {
+            sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
+                .await
+        });
+
+        let _stream = tokio::time::timeout(std::time::Duration::from_secs(1), new_stream_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Fill the stream channel with capacity=16.
+        // With capacity 16, sending 17 messages should trigger the "full" path.
+        for i in 0..18 {
+            let msg = format!("msg{}", i);
+            write_frame(&mut client_io, Command::Psh, 1, msg.as_bytes()).await;
+        }
+        // Give recv_loop time to process
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         drop(client_io);
         let _ = handle.await;
