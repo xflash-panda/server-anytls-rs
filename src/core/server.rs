@@ -19,9 +19,14 @@ use crate::core::session::{
 fn set_tcp_keepalive(stream: &tokio::net::TcpStream) {
     let sock = socket2::SockRef::from(stream);
     let _ = sock.set_keepalive(true);
-    // 30s interval — same as Go's default since 1.13
-    let _ =
-        sock.set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(Duration::from_secs(30)));
+    // TCP_KEEPIDLE=30s (when to start probes), TCP_KEEPINTVL=10s (probe interval).
+    // Without setting interval, OS defaults apply (75s on Linux/macOS),
+    // making dead-connection detection take 30 + 75*9 = 705s instead of 30 + 10*9 = 120s.
+    let _ = sock.set_tcp_keepalive(
+        &socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(30))
+            .with_interval(Duration::from_secs(10)),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -400,6 +405,44 @@ mod tests {
         assert!(
             keepalive,
             "TCP keepalive should be enabled on accepted connections"
+        );
+    }
+
+    /// RED: set_tcp_keepalive should configure keepalive interval (TCP_KEEPINTVL),
+    /// not just the idle time (TCP_KEEPIDLE). Without setting interval, Linux
+    /// defaults to 75s between probes × 9 retries = 675s to detect a dead
+    /// connection. With a 10s interval the detection time drops to ~120s.
+    #[tokio::test]
+    async fn test_tcp_keepalive_sets_interval() {
+        use tokio::net::TcpStream;
+
+        let test_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let test_addr = test_listener.local_addr().unwrap();
+
+        let client_handle =
+            tokio::spawn(async move { TcpStream::connect(test_addr).await.unwrap() });
+
+        let (accepted, _peer) = test_listener.accept().await.unwrap();
+        set_tcp_keepalive(&accepted);
+
+        let sock = socket2::SockRef::from(&accepted);
+
+        drop(client_handle);
+
+        // keepalive_interval() returns the TCP_KEEPINTVL value.
+        // If set_tcp_keepalive properly configured it, it should be ≤ 30s.
+        // RED: Currently only TCP_KEEPIDLE is set; interval is OS default
+        // (75s on Linux, 75s on macOS), so this assertion fails.
+        let interval = sock.tcp_keepalive_interval().expect(
+            "keepalive_interval() should be readable — if this fails, \
+             TCP_KEEPINTVL was never set",
+        );
+        assert!(
+            interval <= Duration::from_secs(30),
+            "TCP keepalive interval should be ≤ 30s for fast dead-connection \
+             detection, but got {interval:?}. set_tcp_keepalive only sets \
+             TCP_KEEPIDLE, not TCP_KEEPINTVL — dead connections take 675s+ \
+             to detect with OS defaults."
         );
     }
 }
