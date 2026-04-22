@@ -170,7 +170,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
 
                 // Write the first command under a lock hold.
                 let mut w = writer.lock().await;
-                if let Err(e) = timed_write(write_cmd_frame(&mut *w, &cmd, &mut combined_buf)).await {
+                if let Err(e) = timed_write(write_cmd_frame(&mut *w, &cmd, &mut combined_buf)).await
+                {
                     break Some(e);
                 }
 
@@ -186,7 +187,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                     // Yield lock so control frame writers get a turn.
                     drop(w);
                     w = writer.lock().await;
-                    if let Err(e) = timed_write(write_cmd_frame(&mut *w, &cmd, &mut combined_buf)).await {
+                    if let Err(e) =
+                        timed_write(write_cmd_frame(&mut *w, &cmd, &mut combined_buf)).await
+                    {
                         break 'outer Some(e);
                     }
                 }
