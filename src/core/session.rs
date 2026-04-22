@@ -143,21 +143,38 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
         tokio::spawn(async move {
             // Reusable buffer for coalescing header+payload into single writes.
             let mut combined_buf = Vec::with_capacity(HEADER_SIZE + u16::MAX as usize);
+
             let err = 'outer: loop {
                 let Some(cmd) = write_cmd_rx.recv().await else {
                     break None;
                 };
+
+                // Write the first command under a lock hold.
                 let mut w = writer.lock().await;
                 if let Err(e) = write_cmd_frame(&mut *w, &cmd, &mut combined_buf).await {
                     break Some(e);
                 }
-                // Drain all pending commands without blocking (batch writes)
+
+                // Batch more pending commands, but **release and re-acquire
+                // the lock between each command** so that control frame
+                // writers (write_frame: SynAck, HeartResponse, etc.) can
+                // interleave.  The Go server acquires/releases the lock per
+                // frame; without this yield the writer task can hold the
+                // lock for the entire batch duration — longer than the
+                // client's 3-second SYN deadline when the connection is
+                // slow or congested.
                 while let Ok(cmd) = write_cmd_rx.try_recv() {
+                    // Yield lock so control frame writers get a turn.
+                    drop(w);
+                    w = writer.lock().await;
                     if let Err(e) = write_cmd_frame(&mut *w, &cmd, &mut combined_buf).await {
                         break 'outer Some(e);
                     }
                 }
-                // Single flush for entire batch
+
+                // Flush remaining data in the BufWriter to TLS.
+                // (A control frame writer may have already flushed part of
+                // the batch between lock yields — that's fine.)
                 if let Err(e) = w.flush().await {
                     break Some(e);
                 }
@@ -491,10 +508,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                 .await?;
         }
         Ok(())
-    }
-
-    pub async fn send_fin(&self, stream_id: u32) -> Result<()> {
-        self.write_frame(Command::Fin, stream_id, &[]).await
     }
 }
 
@@ -1675,6 +1688,130 @@ mod tests {
             result.is_ok(),
             "session should terminate when HeartResponse is not received, \
              but it stayed alive — heartbeat timeout not implemented"
+        );
+    }
+
+    /// RED test: Prove that the writer task's batched lock hold blocks control
+    /// frames (handshake_success / HeartResponse) for longer than the client's
+    /// 3-second SYN deadline, causing the client to kill the entire session.
+    ///
+    /// Scenario:
+    /// 1. Multiple streams write large amounts of data → many WriteCommands queued
+    /// 2. Writer task acquires write_half lock and processes the entire batch
+    /// 3. Duplex buffer is small → writer blocks on write_all mid-batch
+    /// 4. Meanwhile, a control frame (Nop = handshake_success) tries to acquire
+    ///    the same lock → blocked for the entire batch duration
+    /// 5. Client's 3-second SYN deadline expires → session killed →
+    ///    ERR_CONNECTION_CLOSED
+    ///
+    /// The Go server doesn't have this problem because it acquires/releases the
+    /// lock per-frame, not per-batch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_write_frame_blocked_by_writer_batch() {
+        // Small duplex buffer: writer task will block on write_all once
+        // the buffer fills, holding the write_half lock.
+        let (client_io, server_io) = duplex(32 * 1024);
+        let padding = test_padding();
+        let session = Arc::new(Session::new_server(
+            server_io,
+            padding,
+            SessionConfig::default(),
+        ));
+        let settings_data = format!("v=2\npadding-md5={}", session.padding_md5());
+
+        // Split client_io so we can write (send frames) and read (drain) independently
+        let (client_read, mut client_write) = tokio::io::split(client_io);
+
+        write_frame(
+            &mut client_write,
+            Command::Settings,
+            0,
+            settings_data.as_bytes(),
+        )
+        .await;
+
+        // Create 8 streams to simulate a page load
+        for sid in 1..=8u32 {
+            write_frame(&mut client_write, Command::Syn, sid, &[]).await;
+        }
+
+        let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(16);
+        let sess = session.clone();
+        let _recv_handle = tokio::spawn(async move {
+            let _ = sess
+                .recv_loop(new_stream_tx, None, None, CancellationToken::new())
+                .await;
+        });
+
+        // Collect all 8 streams
+        let mut streams = Vec::new();
+        for _ in 0..8 {
+            let stream =
+                tokio::time::timeout(std::time::Duration::from_secs(1), new_stream_rx.recv())
+                    .await
+                    .expect("timeout waiting for stream")
+                    .expect("stream channel closed");
+            streams.push(stream);
+        }
+
+        // Each stream writes 512KB of data through the writer channel.
+        // Total: 8 * 512KB = 4MB queued, far more than the 32KB duplex buffer.
+        let write_handles: Vec<_> = streams
+            .into_iter()
+            .map(|mut stream| {
+                tokio::spawn(async move {
+                    let data = vec![0xCD_u8; 64 * 1024]; // 64KB per write
+                    for _ in 0..8 {
+                        if stream.write_all(&data).await.is_err() {
+                            break;
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        // Let the writer task start processing and fill the duplex buffer.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Slowly drain client side so the writer task makes *some* progress but
+        // stays under pressure, holding the lock in its try_recv batch loop.
+        let drain_handle = tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(client_read);
+            let mut buf = vec![0u8; 4096]; // read slowly: 4KB at a time
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                match reader.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+
+        // Now simulate handshake_success for a new (9th) stream.
+        // This calls write_frame(Nop) which needs the write_half lock.
+        // With the current batching, the writer task holds the lock for the
+        // entire batch → this call is blocked.
+        let session_for_nop = session.clone();
+        let nop_task =
+            tokio::spawn(async move { session_for_nop.write_frame(Command::SynAck, 9, &[]).await });
+
+        // Client's SYN deadline is 3 seconds.
+        // The Nop frame MUST arrive within this window.
+        let nop_result = tokio::time::timeout(std::time::Duration::from_secs(3), nop_task).await;
+
+        // Cleanup
+        for h in write_handles {
+            h.abort();
+        }
+        drain_handle.abort();
+        drop(client_write);
+
+        assert!(
+            nop_result.is_ok(),
+            "write_frame(Nop) blocked for > 3 seconds — writer task batch holds \
+             write_half lock too long. Client would kill the session \
+             (ERR_CONNECTION_CLOSED). The Go server doesn't have this problem \
+             because it releases the lock after every frame."
         );
     }
 }
