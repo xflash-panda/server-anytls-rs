@@ -233,7 +233,10 @@ pub(crate) async fn handle_udp_over_tcp<T: AsyncRead + AsyncWrite + Unpin + Send
         } else {
             "rejected"
         };
-        warn!("rejecting UDP connection to {} ({reason})", request.destination);
+        warn!(
+            "rejecting UDP connection to {} ({reason})",
+            request.destination
+        );
         session.handshake_failure(stream_id, "rejected").await?;
         return Ok(());
     }
@@ -332,8 +335,17 @@ pub(crate) async fn handle_udp_over_tcp<T: AsyncRead + AsyncWrite + Unpin + Send
         r = udp_to_client => r,
     };
 
-    if let Err(ref e) = relay_result {
-        debug!(stream_id, error = %e, "UDP-over-TCP relay ended");
+    match relay_result {
+        Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            debug!(stream_id, "UDP-over-TCP relay ended (client closed)");
+        }
+        Err(Error::StreamClosed) | Err(Error::SessionClosed) => {
+            debug!(stream_id, "UDP-over-TCP relay ended (closed)");
+        }
+        Err(ref e) => {
+            warn!(stream_id, error = %e, "UDP-over-TCP relay ended with error");
+        }
+        Ok(()) => {}
     }
 
     let up = upload_bytes.load(Ordering::Relaxed);

@@ -2192,8 +2192,7 @@ acl:
         let config: AclConfig = serde_yaml::from_str(yaml).unwrap();
         let engine = AclEngine::new(config, None, false).await.unwrap();
 
-        let is_warp =
-            |h: &OutboundHandler| matches!(h, OutboundHandler::Socks5 { .. });
+        let is_warp = |h: &OutboundHandler| matches!(h, OutboundHandler::Socks5 { .. });
         let is_direct = |h: &OutboundHandler| matches!(h, OutboundHandler::Direct(_));
 
         let tcp = Protocol::TCP;
@@ -2227,18 +2226,34 @@ acl:
 
         // ---- Rule 9: warp(www.google.com) — exact domain, any protocol ----
         let h = engine.match_host("www.google.com", 443, tcp).unwrap();
-        assert!(is_warp(&h), "www.google.com tcp/443 should warp, got {:?}", h);
+        assert!(
+            is_warp(&h),
+            "www.google.com tcp/443 should warp, got {:?}",
+            h
+        );
 
         let h = engine.match_host("www.google.com", 80, tcp).unwrap();
-        assert!(is_warp(&h), "www.google.com tcp/80 should warp, got {:?}", h);
+        assert!(
+            is_warp(&h),
+            "www.google.com tcp/80 should warp, got {:?}",
+            h
+        );
 
         // !! UDP/443 被 reject(all, udp/443) 优先拦截，不会走到 warp(www.google.com)
         let h = engine.match_host("www.google.com", 443, udp).unwrap();
-        assert!(h.is_reject(), "www.google.com udp/443 hit reject first, got {:?}", h);
+        assert!(
+            h.is_reject(),
+            "www.google.com udp/443 hit reject first, got {:?}",
+            h
+        );
 
         // UDP non-443 可以正常走到 warp(www.google.com)
         let h = engine.match_host("www.google.com", 80, udp).unwrap();
-        assert!(is_warp(&h), "www.google.com udp/80 should warp, got {:?}", h);
+        assert!(
+            is_warp(&h),
+            "www.google.com udp/80 should warp, got {:?}",
+            h
+        );
 
         // subdomain should NOT match exact domain rule
         let h = engine.match_host("mail.google.com", 443, tcp).unwrap();
@@ -2253,7 +2268,11 @@ acl:
 
         // !! UDP/443 同样被 reject(all, udp/443) 优先拦截
         let h = engine.match_host("ping0.cc", 443, udp).unwrap();
-        assert!(h.is_reject(), "ping0.cc udp/443 hit reject first, got {:?}", h);
+        assert!(
+            h.is_reject(),
+            "ping0.cc udp/443 hit reject first, got {:?}",
+            h
+        );
 
         // UDP non-443 可以正常走到 warp(suffix:ping0.cc)
         let h = engine.match_host("ping0.cc", 80, udp).unwrap();
@@ -2265,6 +2284,5 @@ acl:
 
         let h = engine.match_host("unknown.xyz", 80, udp).unwrap();
         assert!(is_direct(&h), "unknown udp should direct, got {:?}", h);
-
     }
 }
