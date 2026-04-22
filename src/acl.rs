@@ -2164,4 +2164,107 @@ acl:
             result
         );
     }
+
+    /// Verify every rule in acl.yaml against TCP and UDP routing.
+    #[tokio::test]
+    async fn test_all_acl_yaml_rules() {
+        // Replicate acl.yaml inline rules (without geosite, which needs geo data)
+        let yaml = r#"
+outbounds:
+  - name: warp
+    type: socks5
+    socks5:
+      addr: 127.0.0.1:40000
+acl:
+  inline:
+    - reject(all, udp/443)
+    - warp(all, tcp/22)
+    - warp(all, tcp/25)
+    - warp(all, tcp/465)
+    - warp(all, tcp/587)
+    - warp(all, tcp/993)
+    - warp(all, tcp/995)
+    - warp(all, tcp/3389)
+    - warp(www.google.com)
+    - warp(suffix:ping0.cc)
+    - direct(all)
+"#;
+        let config: AclConfig = serde_yaml::from_str(yaml).unwrap();
+        let engine = AclEngine::new(config, None, false).await.unwrap();
+
+        let is_warp =
+            |h: &OutboundHandler| matches!(h, OutboundHandler::Socks5 { .. });
+        let is_direct = |h: &OutboundHandler| matches!(h, OutboundHandler::Direct(_));
+
+        let tcp = Protocol::TCP;
+        let udp = Protocol::UDP;
+
+        // ---- Rule 1: reject(all, udp/443) ----
+        let h = engine.match_host("any.com", 443, udp).unwrap();
+        assert!(h.is_reject(), "udp/443 should reject, got {:?}", h);
+
+        let h = engine.match_host("any.com", 443, tcp).unwrap();
+        assert!(!h.is_reject(), "tcp/443 should NOT reject, got {:?}", h);
+
+        let h = engine.match_host("any.com", 80, udp).unwrap();
+        assert!(!h.is_reject(), "udp/80 should NOT reject, got {:?}", h);
+
+        // ---- Rule 2-8: warp(all, tcp/<port>) ----
+        let warp_ports = [22, 25, 465, 587, 993, 995, 3389];
+        for port in warp_ports {
+            let h = engine.match_host("random.com", port, tcp).unwrap();
+            assert!(is_warp(&h), "tcp/{} should warp, got {:?}", port, h);
+
+            // Same port via UDP should NOT match tcp/ rule → falls to direct(all)
+            let h = engine.match_host("random.com", port, udp).unwrap();
+            assert!(
+                is_direct(&h),
+                "udp/{} should direct (tcp-only rule), got {:?}",
+                port,
+                h
+            );
+        }
+
+        // ---- Rule 9: warp(www.google.com) — exact domain, any protocol ----
+        let h = engine.match_host("www.google.com", 443, tcp).unwrap();
+        assert!(is_warp(&h), "www.google.com tcp/443 should warp, got {:?}", h);
+
+        let h = engine.match_host("www.google.com", 80, tcp).unwrap();
+        assert!(is_warp(&h), "www.google.com tcp/80 should warp, got {:?}", h);
+
+        // !! UDP/443 被 reject(all, udp/443) 优先拦截，不会走到 warp(www.google.com)
+        let h = engine.match_host("www.google.com", 443, udp).unwrap();
+        assert!(h.is_reject(), "www.google.com udp/443 hit reject first, got {:?}", h);
+
+        // UDP non-443 可以正常走到 warp(www.google.com)
+        let h = engine.match_host("www.google.com", 80, udp).unwrap();
+        assert!(is_warp(&h), "www.google.com udp/80 should warp, got {:?}", h);
+
+        // subdomain should NOT match exact domain rule
+        let h = engine.match_host("mail.google.com", 443, tcp).unwrap();
+        assert!(is_direct(&h), "mail.google.com should direct, got {:?}", h);
+
+        // ---- Rule 10: warp(suffix:ping0.cc) ----
+        let h = engine.match_host("ping0.cc", 443, tcp).unwrap();
+        assert!(is_warp(&h), "ping0.cc tcp/443 should warp, got {:?}", h);
+
+        let h = engine.match_host("www.ping0.cc", 80, tcp).unwrap();
+        assert!(is_warp(&h), "www.ping0.cc tcp/80 should warp, got {:?}", h);
+
+        // !! UDP/443 同样被 reject(all, udp/443) 优先拦截
+        let h = engine.match_host("ping0.cc", 443, udp).unwrap();
+        assert!(h.is_reject(), "ping0.cc udp/443 hit reject first, got {:?}", h);
+
+        // UDP non-443 可以正常走到 warp(suffix:ping0.cc)
+        let h = engine.match_host("ping0.cc", 80, udp).unwrap();
+        assert!(is_warp(&h), "ping0.cc udp/80 should warp, got {:?}", h);
+
+        // ---- Rule 11: direct(all) — fallback ----
+        let h = engine.match_host("unknown.xyz", 80, tcp).unwrap();
+        assert!(is_direct(&h), "unknown tcp should direct, got {:?}", h);
+
+        let h = engine.match_host("unknown.xyz", 80, udp).unwrap();
+        assert!(is_direct(&h), "unknown udp should direct, got {:?}", h);
+
+    }
 }
