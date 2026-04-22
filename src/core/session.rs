@@ -1958,11 +1958,10 @@ mod tests {
         });
 
         // Get stream but intentionally NEVER read from it.
-        let _stream =
-            tokio::time::timeout(std::time::Duration::from_secs(1), new_stream_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let _stream = tokio::time::timeout(std::time::Duration::from_secs(1), new_stream_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
 
         // Send enough PSH frames to overflow the channel (capacity=2).
         // After 2 messages buffered, the 3rd+ should trigger try_send Full.
@@ -2048,11 +2047,10 @@ mod tests {
                 .await
         });
 
-        let _stream =
-            tokio::time::timeout(std::time::Duration::from_secs(1), new_stream_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let _stream = tokio::time::timeout(std::time::Duration::from_secs(1), new_stream_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
 
         // Close client → recv_loop should exit.
         drop(client_io);
@@ -2136,7 +2134,8 @@ mod tests {
         assert!(result.is_ok(), "stream 2 blocked — head-of-line blocking!");
         let n = result.unwrap().unwrap();
         assert_eq!(
-            &buf[..n], b"still alive",
+            &buf[..n],
+            b"still alive",
             "stream 2 received wrong data after stream 1 overflow"
         );
 
