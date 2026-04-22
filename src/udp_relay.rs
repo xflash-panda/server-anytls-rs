@@ -225,12 +225,16 @@ pub(crate) async fn handle_udp_over_tcp<T: AsyncRead + AsyncWrite + Unpin + Send
     );
 
     // Check ACL rules for UDP traffic before proceeding.
+    // Proxy is treated as reject because UDP relay via SOCKS5 is not supported.
     let outbound = server.router.route_udp(&request.destination).await;
-    if matches!(outbound, OutboundType::Reject) {
-        warn!("rejecting UDP connection to {}", request.destination);
-        session
-            .handshake_failure(stream_id, "rejected")
-            .await?;
+    if !matches!(outbound, OutboundType::Direct { .. }) {
+        let reason = if matches!(outbound, OutboundType::Proxy(_)) {
+            "UDP proxy not supported"
+        } else {
+            "rejected"
+        };
+        warn!("rejecting UDP connection to {} ({reason})", request.destination);
+        session.handshake_failure(stream_id, "rejected").await?;
         return Ok(());
     }
 
