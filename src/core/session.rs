@@ -315,6 +315,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                                 let stream_id = header.stream_id;
                                 warn!(stream_id, "stream channel full, closing stream");
                                 streams.remove(&stream_id);
+                                // Notify the peer so it stops sending data for
+                                // this stream. Routed through the writer task
+                                // channel to preserve frame ordering.
+                                let _ = write_cmd_tx.try_send(WriteCommand::fin(stream_id));
                             }
                         }
                     }
@@ -1917,5 +1921,240 @@ mod tests {
             result.unwrap().is_err(),
             "write_frame should return an error when the write is stuck"
         );
+    }
+
+    /// RED: When a stream's data channel is full, recv_loop removes it from the
+    /// streams map — but does NOT send a FIN frame to the peer.  The peer
+    /// continues sending data for this stream_id, which is silently dropped.
+    /// The peer never learns the stream is dead until much later (if ever).
+    ///
+    /// Expected: recv_loop should send a FIN (or Alert) to the peer when it
+    /// drops a stream due to channel full, so the peer can stop sending.
+    #[tokio::test]
+    async fn test_channel_full_sends_fin_to_peer() {
+        let (mut client_io, server_io) = duplex(1024 * 1024);
+        let padding = test_padding();
+        // Use a very small stream channel capacity to easily trigger "full".
+        let config = SessionConfig {
+            stream_channel_capacity: 2,
+            ..SessionConfig::default()
+        };
+        let session = Arc::new(Session::new_server(server_io, padding, config));
+        let settings_data = format!("v=2\npadding-md5={}", session.padding_md5());
+        write_frame(
+            &mut client_io,
+            Command::Settings,
+            0,
+            settings_data.as_bytes(),
+        )
+        .await;
+        write_frame(&mut client_io, Command::Syn, 1, &[]).await;
+
+        let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
+        let sess = session.clone();
+        let handle = tokio::spawn(async move {
+            sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
+                .await
+        });
+
+        // Get stream but intentionally NEVER read from it.
+        let _stream =
+            tokio::time::timeout(std::time::Duration::from_secs(1), new_stream_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+
+        // Send enough PSH frames to overflow the channel (capacity=2).
+        // After 2 messages buffered, the 3rd+ should trigger try_send Full.
+        for i in 0..10 {
+            let msg = format!("overflow-{}", i);
+            write_frame(&mut client_io, Command::Psh, 1, msg.as_bytes()).await;
+        }
+
+        // Give recv_loop time to process all frames and detect the full channel.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Now read frames from the client side and look for a FIN for stream 1.
+        // The recv_loop should have sent FIN (or Alert) to notify the peer.
+        // Also send a HeartRequest to force a response (proves the connection is alive).
+        write_frame(&mut client_io, Command::HeartRequest, 0, &[]).await;
+
+        let mut hdr_buf = [0u8; HEADER_SIZE];
+        let mut fin_seen = false;
+        let read_result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if client_io.read_exact(&mut hdr_buf).await.is_err() {
+                    break;
+                }
+                let hdr = FrameHeader::decode(&hdr_buf);
+                if hdr.length > 0 {
+                    let mut skip = vec![0u8; hdr.length as usize];
+                    if client_io.read_exact(&mut skip).await.is_err() {
+                        break;
+                    }
+                }
+                if hdr.stream_id == 1 && hdr.command == Command::Fin {
+                    fin_seen = true;
+                    break;
+                }
+                // Stop after HeartResponse — we've seen all pending frames
+                if hdr.command == Command::HeartResponse {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(read_result.is_ok(), "timed out reading frames");
+        assert!(
+            fin_seen,
+            "BUG: recv_loop dropped stream 1 due to channel full but did NOT send \
+             FIN to peer. The peer will keep sending data that is silently dropped, \
+             causing a zombie stream and data loss."
+        );
+
+        drop(client_io);
+        let _ = handle.await;
+    }
+
+    /// RED: After recv_loop exits, spawned stream handlers may still hold
+    /// Arc<Session>, preventing the underlying connection from being closed.
+    /// This test verifies that Session refcount drops to 1 after recv_loop exits
+    /// (only the caller's reference remains).
+    #[tokio::test]
+    async fn test_session_arc_released_after_recv_loop_exits() {
+        let (mut client_io, server_io) = duplex(65536);
+        let padding = test_padding();
+        let session = Arc::new(Session::new_server(
+            server_io,
+            padding,
+            SessionConfig::default(),
+        ));
+        let settings_data = format!("v=2\npadding-md5={}", session.padding_md5());
+        write_frame(
+            &mut client_io,
+            Command::Settings,
+            0,
+            settings_data.as_bytes(),
+        )
+        .await;
+        // Create a stream so the session is actively used.
+        write_frame(&mut client_io, Command::Syn, 1, &[]).await;
+        write_frame(&mut client_io, Command::Psh, 1, b"some data").await;
+
+        let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
+        let sess = session.clone(); // refcount +1
+        let handle = tokio::spawn(async move {
+            sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
+                .await
+        });
+
+        let _stream =
+            tokio::time::timeout(std::time::Duration::from_secs(1), new_stream_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+
+        // Close client → recv_loop should exit.
+        drop(client_io);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+
+        // After recv_loop exits, give the writer task time to notice channel closure.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Drop the stream (simulates stream handler finishing).
+        drop(_stream);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Session should only be held by our local `session` variable now.
+        let refcount = Arc::strong_count(&session);
+        assert_eq!(
+            refcount, 1,
+            "Session Arc refcount is {} (expected 1). Something is still holding \
+             a reference after recv_loop exited — this means the underlying \
+             TLS/TCP connection stays open (zombie connection / FD leak).",
+            refcount
+        );
+    }
+
+    /// RED: Data sent to a stream AFTER its channel overflowed should be
+    /// accounted for (not silently lost). Currently, once the stream is removed
+    /// from the map, all subsequent PSH data for that stream_id is read from
+    /// the wire but discarded without any tracking.
+    #[tokio::test]
+    async fn test_data_not_silently_lost_after_channel_full() {
+        let (mut client_io, server_io) = duplex(1024 * 1024);
+        let padding = test_padding();
+        let config = SessionConfig {
+            stream_channel_capacity: 2,
+            ..SessionConfig::default()
+        };
+        let session = Arc::new(Session::new_server(server_io, padding, config));
+        let settings_data = format!("v=2\npadding-md5={}", session.padding_md5());
+        write_frame(
+            &mut client_io,
+            Command::Settings,
+            0,
+            settings_data.as_bytes(),
+        )
+        .await;
+        write_frame(&mut client_io, Command::Syn, 1, &[]).await;
+        // Also create stream 2 as a control — it should still work.
+        write_frame(&mut client_io, Command::Syn, 2, &[]).await;
+
+        let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
+        let sess = session.clone();
+        let handle = tokio::spawn(async move {
+            sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
+                .await
+        });
+
+        let _stream1 =
+            tokio::time::timeout(std::time::Duration::from_secs(1), new_stream_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        let mut stream2 =
+            tokio::time::timeout(std::time::Duration::from_secs(1), new_stream_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+
+        // Overflow stream 1's channel (never read from it).
+        for _ in 0..10 {
+            write_frame(&mut client_io, Command::Psh, 1, b"overflow").await;
+        }
+
+        // Give recv_loop time to process.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Now send to stream 2 — it should still work (no head-of-line blocking).
+        write_frame(&mut client_io, Command::Psh, 2, b"still alive").await;
+
+        let mut buf = [0u8; 64];
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(1), stream2.read(&mut buf)).await;
+        assert!(result.is_ok(), "stream 2 blocked — head-of-line blocking!");
+        let n = result.unwrap().unwrap();
+        assert_eq!(
+            &buf[..n], b"still alive",
+            "stream 2 received wrong data after stream 1 overflow"
+        );
+
+        // KEY ASSERTION: After stream 1 overflowed, sending more data to it
+        // should NOT crash/panic the recv_loop. The session should remain alive.
+        write_frame(&mut client_io, Command::Psh, 1, b"after overflow").await;
+        write_frame(&mut client_io, Command::Psh, 2, b"control").await;
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(1), stream2.read(&mut buf)).await;
+        assert!(
+            result.is_ok(),
+            "recv_loop crashed or hung after receiving data for an overflowed stream"
+        );
+        let n = result.unwrap().unwrap();
+        assert_eq!(&buf[..n], b"control");
+
+        drop(client_io);
+        let _ = handle.await;
     }
 }

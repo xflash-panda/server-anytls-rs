@@ -15,11 +15,7 @@ pub struct FinSender {
 
 impl FinSender {
     pub async fn send_fin(&self) -> io::Result<()> {
-        let cmd = WriteCommand {
-            stream_id: self.stream_id,
-            data: Bytes::new(),
-            fin: true,
-        };
+        let cmd = WriteCommand::fin(self.stream_id);
         self.tx
             .send(cmd)
             .await
@@ -33,6 +29,16 @@ pub struct WriteCommand {
     /// When true, the writer task emits a FIN frame after any data.
     /// Routing FIN through the same channel as PSH guarantees ordering.
     pub fin: bool,
+}
+
+impl WriteCommand {
+    pub fn fin(stream_id: u32) -> Self {
+        Self {
+            stream_id,
+            data: Bytes::new(),
+            fin: true,
+        }
+    }
 }
 
 pub struct Stream {
