@@ -75,6 +75,25 @@ async fn write_cmd_frame<W: AsyncWriteExt + Unpin>(
 pub const DEFAULT_WRITE_BUF_SIZE: usize = 32 * 1024;
 pub const DEFAULT_STREAM_CHANNEL_CAPACITY: usize = 128;
 
+/// Maximum time to wait for a single write+flush operation before treating
+/// the connection as dead. 5s is enough for the slowest legitimate writes
+/// (32KB flush @ 500Kbps ≈ 0.5s) while staying shorter than typical client
+/// session-creation timeouts (5–10s).
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Wraps an async write operation with [`WRITE_TIMEOUT`], converting an
+/// elapsed timeout to [`crate::error::Error::WriteTimeout`].
+async fn timed_write<F>(fut: F) -> Result<()>
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    match tokio::time::timeout(WRITE_TIMEOUT, fut).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => Err(crate::error::Error::WriteTimeout),
+    }
+}
+
 pub struct SessionConfig {
     pub max_streams: usize,
     pub write_cmd_capacity: usize,
@@ -151,7 +170,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
 
                 // Write the first command under a lock hold.
                 let mut w = writer.lock().await;
-                if let Err(e) = write_cmd_frame(&mut *w, &cmd, &mut combined_buf).await {
+                if let Err(e) = timed_write(write_cmd_frame(&mut *w, &cmd, &mut combined_buf)).await {
                     break Some(e);
                 }
 
@@ -167,7 +186,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                     // Yield lock so control frame writers get a turn.
                     drop(w);
                     w = writer.lock().await;
-                    if let Err(e) = write_cmd_frame(&mut *w, &cmd, &mut combined_buf).await {
+                    if let Err(e) = timed_write(write_cmd_frame(&mut *w, &cmd, &mut combined_buf)).await {
                         break 'outer Some(e);
                     }
                 }
@@ -175,7 +194,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                 // Flush remaining data in the BufWriter to TLS.
                 // (A control frame writer may have already flushed part of
                 // the batch between lock yields — that's fine.)
-                if let Err(e) = w.flush().await {
+                if let Err(e) = timed_write(w.flush()).await {
                     break Some(e);
                 }
             };
@@ -414,22 +433,25 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
         let total = HEADER_SIZE + data.len();
         let mut w = self.write_half.lock().await;
 
-        // Use stack buffer for small control frames (FIN, SynAck, HeartResponse, etc.)
-        // to avoid heap allocation. Most control frames are ≤ 128 bytes.
-        if total <= 128 {
-            let mut stack_buf = [0u8; 128];
-            stack_buf[..HEADER_SIZE].copy_from_slice(&hdr_buf);
-            stack_buf[HEADER_SIZE..total].copy_from_slice(data);
-            w.write_all(&stack_buf[..total]).await?;
-        } else {
-            let mut buf = Vec::with_capacity(total);
-            buf.extend_from_slice(&hdr_buf);
-            buf.extend_from_slice(data);
-            w.write_all(&buf).await?;
-        }
-        // Flush immediately so control frames are not delayed in the buffer.
-        w.flush().await?;
-        Ok(())
+        timed_write(async {
+            // Use stack buffer for small control frames (FIN, SynAck, HeartResponse, etc.)
+            // to avoid heap allocation. Most control frames are ≤ 128 bytes.
+            if total <= 128 {
+                let mut stack_buf = [0u8; 128];
+                stack_buf[..HEADER_SIZE].copy_from_slice(&hdr_buf);
+                stack_buf[HEADER_SIZE..total].copy_from_slice(data);
+                w.write_all(&stack_buf[..total]).await?;
+            } else {
+                let mut buf = Vec::with_capacity(total);
+                buf.extend_from_slice(&hdr_buf);
+                buf.extend_from_slice(data);
+                w.write_all(&buf).await?;
+            }
+            // Flush immediately so control frames are not delayed in the buffer.
+            w.flush().await?;
+            Ok(())
+        })
+        .await
     }
 
     /// Batch-write settings response frames (UpdatePaddingScheme and/or
@@ -490,9 +512,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
         }
 
         let mut w = self.write_half.lock().await;
-        w.write_all(&buf).await?;
-        w.flush().await?;
-        Ok(())
+        timed_write(async {
+            w.write_all(&buf).await?;
+            w.flush().await?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn handshake_success(&self, stream_id: u32) -> Result<()> {
@@ -1812,6 +1837,82 @@ mod tests {
              write_half lock too long. Client would kill the session \
              (ERR_CONNECTION_CLOSED). The Go server doesn't have this problem \
              because it releases the lock after every frame."
+        );
+    }
+
+    /// RED: write_frame should return an error (not block forever) when the
+    /// underlying writer is stuck (e.g. TCP send buffer full on a dead connection).
+    /// Currently write_frame has no internal write timeout, so it blocks
+    /// indefinitely — causing HeartResponse/SynAck starvation and eventually
+    /// "failed to create session: context deadline exceeded" on the client.
+    #[tokio::test(start_paused = true)]
+    async fn test_write_frame_returns_error_on_blocked_writer() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+        /// AsyncWrite that never completes — simulates TCP send buffer full
+        /// on a half-dead connection where the remote stopped reading.
+        struct BlockingWrite;
+
+        impl AsyncRead for BlockingWrite {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Pending
+            }
+        }
+
+        impl AsyncWrite for BlockingWrite {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Pending
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Pending
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Pending
+            }
+        }
+
+        let session = Arc::new(Session::new_server(
+            BlockingWrite,
+            test_padding(),
+            SessionConfig::default(),
+        ));
+
+        // If write_frame had an internal timeout, it would return Err(...)
+        // before this 30s external timeout, making result = Ok(Err(...)).
+        // Without internal timeout, write_frame blocks forever,
+        // the external timeout fires → result = Err(Elapsed).
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            session.write_frame(Command::HeartResponse, 0, &[]),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "write_frame blocked indefinitely on a stuck writer — no internal \
+             write timeout. This causes HeartResponse/SynAck to never be sent, \
+             and the client sees 'context deadline exceeded'."
+        );
+        // The returned Result should be an error (write timeout / broken pipe)
+        assert!(
+            result.unwrap().is_err(),
+            "write_frame should return an error when the write is stuck"
         );
     }
 }
