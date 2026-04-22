@@ -6,9 +6,9 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::UdpSocket;
-use tracing::debug;
+use tracing::{debug, warn};
 
-use crate::core::hooks::{Address, UserId};
+use crate::core::hooks::{Address, OutboundType, UserId};
 use crate::core::server::Server;
 use crate::core::session::Session;
 use crate::core::stream::Stream;
@@ -223,6 +223,16 @@ pub(crate) async fn handle_udp_over_tcp<T: AsyncRead + AsyncWrite + Unpin + Send
         destination = %request.destination,
         "UDP-over-TCP session starting"
     );
+
+    // Check ACL rules for UDP traffic before proceeding.
+    let outbound = server.router.route_udp(&request.destination).await;
+    if matches!(outbound, OutboundType::Reject) {
+        warn!("rejecting UDP connection to {}", request.destination);
+        session
+            .handshake_failure(stream_id, "rejected")
+            .await?;
+        return Ok(());
+    }
 
     // If connect mode, pre-resolve the destination and "connect" the socket
     // so we can use send/recv instead of send_to/recv_from.

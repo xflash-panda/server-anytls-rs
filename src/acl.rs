@@ -753,9 +753,13 @@ impl AclRouter {
     }
 }
 
-#[async_trait]
-impl server_anytls_rs::OutboundRouter for AclRouter {
-    async fn route(&self, addr: &server_anytls_rs::Address) -> server_anytls_rs::OutboundType {
+impl AclRouter {
+    /// Shared routing logic parameterized by protocol.
+    async fn route_with_protocol(
+        &self,
+        addr: &server_anytls_rs::Address,
+        protocol: Protocol,
+    ) -> server_anytls_rs::OutboundType {
         use server_anytls_rs::{Address, OutboundType};
 
         // Resolved addresses from DNS lookup (reused to avoid duplicate resolution).
@@ -807,7 +811,7 @@ impl server_anytls_rs::OutboundRouter for AclRouter {
         let host = addr.host_str();
         let port = addr.port();
 
-        match self.engine.match_host(&host, port, Protocol::TCP) {
+        match self.engine.match_host(&host, port, protocol) {
             Some(handler) => match &*handler {
                 OutboundHandler::Direct(_) => OutboundType::Direct {
                     resolved: resolved_addrs,
@@ -821,6 +825,17 @@ impl server_anytls_rs::OutboundRouter for AclRouter {
                 resolved: resolved_addrs,
             },
         }
+    }
+}
+
+#[async_trait]
+impl server_anytls_rs::OutboundRouter for AclRouter {
+    async fn route(&self, addr: &server_anytls_rs::Address) -> server_anytls_rs::OutboundType {
+        self.route_with_protocol(addr, Protocol::TCP).await
+    }
+
+    async fn route_udp(&self, addr: &server_anytls_rs::Address) -> server_anytls_rs::OutboundType {
+        self.route_with_protocol(addr, Protocol::UDP).await
     }
 }
 
@@ -2112,6 +2127,41 @@ acl:
             "cache size {} should be near max {}",
             cache_len,
             DNS_CACHE_MAX_ENTRIES
+        );
+    }
+
+    /// RED test: route_udp() must use Protocol::UDP so that
+    /// `reject(all, udp/443)` actually blocks UDP traffic.
+    #[tokio::test]
+    async fn test_acl_router_route_udp_rejects_udp_443() {
+        use server_anytls_rs::{Address, OutboundRouter, OutboundType};
+
+        let yaml = r#"
+outbounds: []
+acl:
+  inline:
+    - reject(all, udp/443)
+    - direct(all)
+"#;
+        let config: AclConfig = serde_yaml::from_str(yaml).unwrap();
+        let engine = AclEngine::new(config, None, false).await.unwrap();
+        let router = AclRouter::with_block_private_ip(engine, false);
+
+        // UDP on port 443 must be rejected
+        let addr = Address::Domain("s.youtube.com".to_string(), 443);
+        let result = router.route_udp(&addr).await;
+        assert!(
+            matches!(result, OutboundType::Reject),
+            "expected Reject for UDP/443, got {:?}",
+            result
+        );
+
+        // TCP on port 443 should still be direct (route, not route_udp)
+        let result = router.route(&addr).await;
+        assert!(
+            matches!(result, OutboundType::Direct { .. }),
+            "expected Direct for TCP/443, got {:?}",
+            result
         );
     }
 }

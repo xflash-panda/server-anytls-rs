@@ -67,7 +67,7 @@ pub struct CliArgs {
 
     /// Server-side keepalive interval to prevent NAT from dropping idle connections.
     /// Set to "0s" to disable.
-    #[arg(long, env = "X_PANDA_ANYTLS_KEEPALIVE_INTERVAL", default_value = "30s", value_parser = parse_duration)]
+    #[arg(long, env = "X_PANDA_ANYTLS_KEEPALIVE_INTERVAL", default_value = "60s", value_parser = parse_duration)]
     pub keepalive_interval: Duration,
 
     #[arg(long = "api_timeout", env = "X_PANDA_ANYTLS_API_TIMEOUT", default_value = "15s", value_parser = parse_duration)]

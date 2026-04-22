@@ -57,7 +57,7 @@ impl Default for ServerConfig {
             tcp_connect_timeout: Duration::from_secs(5),
             idle_timeout: Duration::from_secs(300),
             handshake_timeout: Duration::from_secs(10),
-            keepalive_interval: Some(Duration::from_secs(30)),
+            keepalive_interval: Some(Duration::from_secs(60)),
             write_buf_size: DEFAULT_WRITE_BUF_SIZE,
             stream_channel_capacity: DEFAULT_STREAM_CHANNEL_CAPACITY,
         }
