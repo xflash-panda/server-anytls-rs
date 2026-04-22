@@ -29,6 +29,9 @@ pub enum Error {
     #[error("frame payload too large: {0} bytes (max 65535)")]
     FrameTooLarge(usize),
 
+    #[error("write timeout")]
+    WriteTimeout,
+
     #[error("padding scheme parse error: {0}")]
     PaddingParse(String),
 }
