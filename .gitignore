@@ -5,3 +5,4 @@ docs/
 # Claude
 CLAUDE.md
 .claude/
+acl.yaml
