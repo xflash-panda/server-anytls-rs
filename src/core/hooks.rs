@@ -119,6 +119,12 @@ pub trait StatsCollector: Send + Sync {
 #[async_trait]
 pub trait OutboundRouter: Send + Sync {
     async fn route(&self, target: &Address) -> OutboundType;
+
+    /// Route a UDP target. Defaults to `route()` but implementations can
+    /// override to match protocol-specific ACL rules (e.g. `reject(all, udp/443)`).
+    async fn route_udp(&self, target: &Address) -> OutboundType {
+        self.route(target).await
+    }
 }
 
 // ---------------------------------------------------------------------------
