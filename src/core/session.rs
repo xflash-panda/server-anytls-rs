@@ -75,6 +75,12 @@ async fn write_cmd_frame<W: AsyncWriteExt + Unpin>(
 pub const DEFAULT_WRITE_BUF_SIZE: usize = 32 * 1024;
 pub const DEFAULT_STREAM_CHANNEL_CAPACITY: usize = 128;
 
+/// Maximum number of WriteCommands processed in a single writer batch
+/// before flushing. Prevents the try_recv loop from spinning indefinitely
+/// under sustained high throughput, which would defer flush() and consume
+/// 100% CPU on the writer task.
+const MAX_BATCH_SIZE: usize = 64;
+
 /// Maximum time to wait for a single control frame write+flush before
 /// treating the connection as dead. Only applied to control frames
 /// (HeartResponse, SynAck, Settings, etc.) which are small and should
@@ -186,13 +192,18 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                 // lock for the entire batch duration — longer than the
                 // client's 3-second SYN deadline when the connection is
                 // slow or congested.
-                while let Ok(cmd) = write_cmd_rx.try_recv() {
+                let mut batch_remaining = MAX_BATCH_SIZE - 1;
+                while batch_remaining > 0 {
+                    let Ok(cmd) = write_cmd_rx.try_recv() else {
+                        break;
+                    };
                     // Yield lock so control frame writers get a turn.
                     drop(w);
                     w = writer.lock().await;
                     if let Err(e) = write_cmd_frame(&mut *w, &cmd, &mut combined_buf).await {
                         break 'outer Some(e);
                     }
+                    batch_remaining -= 1;
                 }
 
                 // Flush remaining data in the BufWriter to TLS.
@@ -383,7 +394,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
         header.encode(&mut hdr_buf);
 
         let total = HEADER_SIZE + data.len();
-        let mut w = self.write_half.lock().await;
+        let mut w = tokio::time::timeout(WRITE_TIMEOUT, self.write_half.lock())
+            .await
+            .map_err(|_| crate::error::Error::WriteTimeout)?;
 
         timed_write(async {
             // Use stack buffer for small control frames (FIN, SynAck, HeartResponse, etc.)
@@ -463,7 +476,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
             buf.extend_from_slice(b"v=2");
         }
 
-        let mut w = self.write_half.lock().await;
+        let mut w = tokio::time::timeout(WRITE_TIMEOUT, self.write_half.lock())
+            .await
+            .map_err(|_| crate::error::Error::WriteTimeout)?;
         timed_write(async {
             w.write_all(&buf).await?;
             w.flush().await?;
@@ -2081,5 +2096,103 @@ mod tests {
         drop(stream);
         let _ = handle.await;
         let _ = drain.await;
+    }
+
+    /// RED: The writer task's try_recv batch loop has no upper limit.
+    /// When 200 commands are queued, all 200 are drained in a single batch
+    /// before flush() is called. Under continuous load this means flush is
+    /// indefinitely deferred and the loop spins at 100% CPU.
+    #[tokio::test]
+    async fn test_writer_batch_should_be_limited() {
+        use crate::core::stream::WriteCommand;
+
+        let (_client_io, server_io) = duplex(1024 * 1024);
+        let (_, write_half) = tokio::io::split(server_io);
+        let writer = Arc::new(Mutex::new(tokio::io::BufWriter::with_capacity(
+            DEFAULT_WRITE_BUF_SIZE,
+            write_half,
+        )));
+        let (tx, mut rx) = mpsc::channel::<WriteCommand>(512);
+
+        // Fill channel with 200 commands.
+        let num_commands = 200u32;
+        for i in 0..num_commands {
+            tx.try_send(WriteCommand {
+                stream_id: i,
+                data: bytes::Bytes::from_static(b"hello"),
+                fin: false,
+            })
+            .unwrap();
+        }
+
+        // Simulate one iteration of the writer task's outer loop.
+        let mut combined_buf = Vec::with_capacity(HEADER_SIZE + u16::MAX as usize);
+        let cmd = rx.recv().await.unwrap();
+        let mut w = writer.lock().await;
+        write_cmd_frame(&mut *w, &cmd, &mut combined_buf)
+            .await
+            .unwrap();
+
+        let mut batch_count = 1u32;
+        let mut batch_remaining = MAX_BATCH_SIZE - 1;
+        while batch_remaining > 0 {
+            let Ok(cmd) = rx.try_recv() else {
+                break;
+            };
+            drop(w);
+            w = writer.lock().await;
+            write_cmd_frame(&mut *w, &cmd, &mut combined_buf)
+                .await
+                .unwrap();
+            batch_count += 1;
+            batch_remaining -= 1;
+        }
+        w.flush().await.unwrap();
+        drop(w);
+
+        // RED: batch_count == 200 — all commands processed in one batch, no limit.
+        // GREEN (after fix): batch_count <= MAX_BATCH_SIZE.
+        assert!(
+            batch_count <= 64,
+            "writer batch should be limited to avoid CPU spinning, \
+             but processed {batch_count} commands in a single batch"
+        );
+    }
+
+    /// RED: write_frame's lock acquisition has no timeout. When the
+    /// write_half lock is held externally (simulating a busy writer task),
+    /// write_frame blocks indefinitely instead of returning WriteTimeout.
+    #[tokio::test]
+    async fn test_write_frame_lock_acquisition_has_timeout() {
+        let (_, server_io) = duplex(8192);
+        let padding = test_padding();
+        let session = Arc::new(Session::new_server(
+            server_io,
+            padding,
+            SessionConfig::default(),
+        ));
+
+        // Hold the write_half lock to simulate a busy writer task.
+        let _guard = session.write_half.lock().await;
+
+        // write_frame should return WriteTimeout within WRITE_TIMEOUT,
+        // NOT block indefinitely waiting for the lock.
+        let deadline = WRITE_TIMEOUT + std::time::Duration::from_secs(2);
+        let result = tokio::time::timeout(
+            deadline,
+            session.write_frame(Command::HeartResponse, 0, &[]),
+        )
+        .await;
+
+        drop(_guard);
+
+        // RED: result is Err(Elapsed) — the outer timeout fires because
+        // write_frame blocked for > WRITE_TIMEOUT+2s on lock acquisition.
+        // GREEN (after fix): result is Ok(Err(WriteTimeout)).
+        assert!(
+            result.is_ok(),
+            "write_frame should return WriteTimeout within {WRITE_TIMEOUT:?}, \
+             not block indefinitely on lock acquisition"
+        );
     }
 }

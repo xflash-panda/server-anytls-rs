@@ -14,6 +14,9 @@ use crate::core::session::Session;
 use crate::core::stream::Stream;
 use crate::error::{Error, Result};
 
+/// Buffer size for each direction of `copy_bidirectional` relay.
+const RELAY_BUF_SIZE: usize = 32 * 1024;
+
 /// Parse a SOCKS5-style address from the given byte slice.
 /// Returns `(Address, bytes_consumed)` on success.
 pub(crate) fn parse_socks_address(data: &[u8]) -> Result<(Address, usize)> {
@@ -275,7 +278,6 @@ where
         bytes_written: download_bytes.clone(),
     };
 
-    const RELAY_BUF_SIZE: usize = 256 * 1024;
     let _relay_result = tokio::io::copy_bidirectional_with_sizes(
         &mut counted_stream,
         &mut counted_remote,
@@ -579,5 +581,18 @@ mod tests {
         assert!(up > 0, "expected upload bytes to be recorded, got 0");
         assert!(down > 0, "expected download bytes to be recorded, got 0");
         assert_eq!(recording.request_count.load(Ordering::Relaxed), 1);
+    }
+
+    /// RED: RELAY_BUF_SIZE is 256KB, which causes excessive memory usage
+    /// under high concurrency (256 streams × 256KB × 2 = 128MB per session).
+    /// Should be <= 64KB for reasonable memory footprint.
+    #[test]
+    fn test_relay_buf_size_reasonable() {
+        assert!(
+            RELAY_BUF_SIZE <= 64 * 1024,
+            "RELAY_BUF_SIZE should be <= 64KB for reasonable memory usage \
+             under high concurrency, but is {} KB",
+            RELAY_BUF_SIZE / 1024
+        );
     }
 }
