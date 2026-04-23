@@ -75,14 +75,17 @@ async fn write_cmd_frame<W: AsyncWriteExt + Unpin>(
 pub const DEFAULT_WRITE_BUF_SIZE: usize = 32 * 1024;
 pub const DEFAULT_STREAM_CHANNEL_CAPACITY: usize = 128;
 
-/// Maximum time to wait for a single write+flush operation before treating
-/// the connection as dead. 5s is enough for the slowest legitimate writes
-/// (32KB flush @ 500Kbps ≈ 0.5s) while staying shorter than typical client
-/// session-creation timeouts (5–10s).
+/// Maximum time to wait for a single control frame write+flush before
+/// treating the connection as dead. Only applied to control frames
+/// (HeartResponse, SynAck, Settings, etc.) which are small and should
+/// complete quickly. Data frame writes have no timeout — network congestion
+/// can cause legitimate delays. This aligns with sing-anytls where only
+/// writeControlFrame has a deadline.
 const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Wraps an async write operation with [`WRITE_TIMEOUT`], converting an
 /// elapsed timeout to [`crate::error::Error::WriteTimeout`].
+/// Used only for control frame writes, not data frame writes.
 async fn timed_write<F>(fut: F) -> Result<()>
 where
     F: std::future::Future<Output = std::io::Result<()>>,
@@ -144,8 +147,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
     pub async fn recv_loop(
         self: Arc<Self>,
         new_stream_tx: mpsc::Sender<Stream>,
-        idle_timeout: Option<std::time::Duration>,
-        keepalive_interval: Option<std::time::Duration>,
         cancel_token: CancellationToken,
     ) -> Result<()> {
         let mut streams: FxHashMap<u32, mpsc::Sender<Bytes>> = FxHashMap::default();
@@ -169,8 +170,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                 };
 
                 // Write the first command under a lock hold.
+                // No timeout on data frame writes — network congestion can
+                // cause legitimate delays exceeding 5s. Aligns with
+                // sing-anytls where writeDataFrame has no deadline.
                 let mut w = writer.lock().await;
-                if let Err(e) = timed_write(write_cmd_frame(&mut *w, &cmd, &mut combined_buf)).await {
+                if let Err(e) = write_cmd_frame(&mut *w, &cmd, &mut combined_buf).await {
                     break Some(e);
                 }
 
@@ -186,7 +190,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                     // Yield lock so control frame writers get a turn.
                     drop(w);
                     w = writer.lock().await;
-                    if let Err(e) = timed_write(write_cmd_frame(&mut *w, &cmd, &mut combined_buf)).await {
+                    if let Err(e) = write_cmd_frame(&mut *w, &cmd, &mut combined_buf).await {
                         break 'outer Some(e);
                     }
                 }
@@ -194,7 +198,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                 // Flush remaining data in the BufWriter to TLS.
                 // (A control frame writer may have already flushed part of
                 // the batch between lock yields — that's fine.)
-                if let Err(e) = timed_write(w.flush()).await {
+                if let Err(e) = w.flush().await {
                     break Some(e);
                 }
             };
@@ -208,44 +212,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
         // Reusable buffer to avoid per-frame heap allocation
         let mut payload_buf = BytesMut::with_capacity(u16::MAX as usize);
 
-        // Idle timeout: when enabled, a pinned Sleep resets after every
-        // received frame.  When disabled (None), we use a future that never
-        // completes so a single select! handles both cases without duplication.
-        let idle_sleep = tokio::time::sleep(idle_timeout.unwrap_or_default());
-        tokio::pin!(idle_sleep);
-
-        // Server-side keepalive: periodically send HeartRequest to prevent
-        // NAT devices from dropping idle connections.  The timer resets on
-        // every received frame so we only send keepalives when truly idle.
-        // If a HeartRequest goes unanswered by the next tick, the connection
-        // is considered dead.
-        let keepalive_sleep = tokio::time::sleep(keepalive_interval.unwrap_or_default());
-        tokio::pin!(keepalive_sleep);
-        let mut heartbeat_pending = false;
-
         loop {
             let mut hdr_buf = [0u8; HEADER_SIZE];
             let read_result = tokio::select! {
                 r = reader.read_exact(&mut hdr_buf) => r,
-                _ = &mut idle_sleep, if idle_timeout.is_some() => {
-                    debug!("session idle timeout");
-                    break;
-                }
-                _ = &mut keepalive_sleep, if keepalive_interval.is_some() => {
-                    if heartbeat_pending {
-                        debug!("heartbeat timeout — no HeartResponse received");
-                        break;
-                    }
-                    if let Err(e) = self.write_frame(Command::HeartRequest, 0, &[]).await {
-                        debug!("keepalive write failed: {}", e);
-                        break;
-                    }
-                    heartbeat_pending = true;
-                    // unwrap is safe: guard ensures keepalive_interval is Some
-                    let d = keepalive_interval.unwrap();
-                    keepalive_sleep.as_mut().reset(tokio::time::Instant::now() + d);
-                    continue;
-                }
                 _ = cancel_token.cancelled() => {
                     debug!("session cancelled by connection manager");
                     break;
@@ -263,28 +233,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                 }
                 Err(e) => return Err(e.into()),
             }
-            // Reset keepalive timer on activity — only send keepalives when idle.
-            if let Some(d) = keepalive_interval {
-                keepalive_sleep
-                    .as_mut()
-                    .reset(tokio::time::Instant::now() + d);
-                // Any received frame proves the connection is alive.
-                heartbeat_pending = false;
-            }
 
             let header = FrameHeader::decode(&hdr_buf);
-
-            // Reset idle timer only on data frames (not heartbeat frames).
-            // This ensures connections without real traffic will eventually
-            // time out, matching the Go server behavior.
-            if let Some(d) = idle_timeout
-                && !matches!(
-                    header.command,
-                    Command::HeartRequest | Command::HeartResponse
-                )
-            {
-                idle_sleep.as_mut().reset(tokio::time::Instant::now() + d);
-            }
             let len = header.length as usize;
 
             match header.command {
@@ -408,8 +358,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                     self.write_frame(Command::HeartResponse, 0, &[]).await?;
                 }
                 // HeartResponse, Waste, and unknown commands: skip payload.
-                // (heartbeat_pending is already cleared by the blanket reset
-                // on any received frame above.)
                 _ => {
                     if len > 0 {
                         payload_buf.resize(len, 0);
@@ -592,7 +540,7 @@ mod tests {
         let (new_stream_tx, _) = tokio::sync::mpsc::channel(8);
         let sess = session.clone();
         let handle = tokio::spawn(async move {
-            sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
+            sess.recv_loop(new_stream_tx, CancellationToken::new())
                 .await
         });
         drop(client_io);
@@ -619,7 +567,7 @@ mod tests {
         .await;
         let sess = session.clone();
         let handle = tokio::spawn(async move {
-            sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
+            sess.recv_loop(new_stream_tx, CancellationToken::new())
                 .await
         });
         write_frame(&mut client_io, Command::Syn, 1, &[]).await;
@@ -652,7 +600,7 @@ mod tests {
         .await;
         let sess = session.clone();
         let handle = tokio::spawn(async move {
-            sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
+            sess.recv_loop(new_stream_tx, CancellationToken::new())
                 .await
         });
         write_frame(&mut client_io, Command::Syn, 1, &[]).await;
@@ -695,7 +643,7 @@ mod tests {
         .await;
         let sess = session.clone();
         let handle = tokio::spawn(async move {
-            sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
+            sess.recv_loop(new_stream_tx, CancellationToken::new())
                 .await
         });
 
@@ -755,7 +703,7 @@ mod tests {
         .await;
         let sess = session.clone();
         let handle = tokio::spawn(async move {
-            sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
+            sess.recv_loop(new_stream_tx, CancellationToken::new())
                 .await
         });
         write_frame(&mut client_io, Command::HeartRequest, 0, &[]).await;
@@ -812,15 +760,7 @@ mod tests {
         let (new_stream_tx, _) = tokio::sync::mpsc::channel(8);
         let sess = session.clone();
         let ct = cancel_token.clone();
-        let handle = tokio::spawn(async move {
-            sess.recv_loop(
-                new_stream_tx,
-                Some(std::time::Duration::from_secs(300)),
-                None,
-                ct,
-            )
-            .await
-        });
+        let handle = tokio::spawn(async move { sess.recv_loop(new_stream_tx, ct).await });
 
         // Connection is alive — send a heartbeat to confirm
         write_frame(&mut client_io, Command::HeartRequest, 0, &[]).await;
@@ -863,7 +803,7 @@ mod tests {
         let (new_stream_tx, _) = tokio::sync::mpsc::channel(8);
         let sess = session.clone();
         let handle = tokio::spawn(async move {
-            sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
+            sess.recv_loop(new_stream_tx, CancellationToken::new())
                 .await
         });
 
@@ -908,61 +848,6 @@ mod tests {
         let _ = handle.await;
     }
 
-    /// Active connections must survive past the idle timeout duration.
-    /// Idle timeout should reset on every received frame, not be a fixed timer.
-    #[tokio::test]
-    async fn test_idle_timeout_resets_on_activity() {
-        let (mut client_io, server_io) = duplex(65536);
-        let padding = test_padding();
-        let session = Arc::new(Session::new_server(
-            server_io,
-            padding,
-            SessionConfig::default(),
-        ));
-        let settings_data = format!("v=2\npadding-md5={}", session.padding_md5());
-        write_frame(
-            &mut client_io,
-            Command::Settings,
-            0,
-            settings_data.as_bytes(),
-        )
-        .await;
-
-        let (new_stream_tx, _) = tokio::sync::mpsc::channel(8);
-        let sess = session.clone();
-        let idle_timeout = std::time::Duration::from_millis(200);
-        let handle = tokio::spawn(async move {
-            sess.recv_loop(
-                new_stream_tx,
-                Some(idle_timeout),
-                None,
-                CancellationToken::new(),
-            )
-            .await
-        });
-
-        // Send Waste frames every 100ms for 500ms (well past the 200ms timeout).
-        // Only data frames reset idle timeout; heartbeat frames do not.
-        for _ in 0..5 {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            write_frame(&mut client_io, Command::Waste, 0, &[]).await;
-        }
-
-        // Session should still be alive — the idle timer should have been
-        // reset by each data frame.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert!(
-            !handle.is_finished(),
-            "session terminated despite continuous activity — idle timeout not resetting"
-        );
-
-        // Now stop sending.  Session should idle-timeout within ~200ms.
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
-        assert!(result.is_ok(), "session did not terminate after going idle");
-
-        drop(client_io);
-    }
-
     /// Issue #2: write_cmd channel (capacity 256) shared by ALL streams.
     /// Verify that the writer task's try_recv batch drains the entire channel
     /// under a single lock hold. When the batch is large (many streams writing
@@ -994,7 +879,7 @@ mod tests {
         let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
         let sess = session.clone();
         let handle = tokio::spawn(async move {
-            sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
+            sess.recv_loop(new_stream_tx, CancellationToken::new())
                 .await
         });
 
@@ -1079,7 +964,7 @@ mod tests {
         let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
         let sess = session.clone();
         let handle = tokio::spawn(async move {
-            sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
+            sess.recv_loop(new_stream_tx, CancellationToken::new())
                 .await
         });
 
@@ -1195,7 +1080,7 @@ mod tests {
         let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
         let sess = session.clone();
         let handle = tokio::spawn(async move {
-            sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
+            sess.recv_loop(new_stream_tx, CancellationToken::new())
                 .await
         });
 
@@ -1253,83 +1138,79 @@ mod tests {
         let _ = handle.await;
     }
 
-    /// Server-side keepalive: recv_loop should proactively send HeartRequest
-    /// at the configured interval to prevent NAT devices from dropping idle
-    /// connections.
+    /// When the writer task encounters a write error (e.g. network disruption),
+    /// recv_loop must detect this and exit promptly. Otherwise the session stays
+    /// "alive" on the read side while all streams can no longer send data back,
+    /// causing clients to see ERR_CONNECTION_CLOSED on all concurrent requests.
     #[tokio::test]
-    async fn test_server_keepalive_sends_heart_request() {
-        let (mut client_io, server_io) = duplex(65536);
-        let padding = test_padding();
-        let session = Arc::new(Session::new_server(
-            server_io,
-            padding,
-            SessionConfig::default(),
-        ));
-        let settings_data = format!("v=2\npadding-md5={}", session.padding_md5());
-        write_frame(
-            &mut client_io,
-            Command::Settings,
-            0,
-            settings_data.as_bytes(),
-        )
-        .await;
+    async fn test_recv_loop_exits_when_writer_task_dies() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{Context, Poll};
+        use tokio::io::ReadBuf;
 
-        let (new_stream_tx, _) = tokio::sync::mpsc::channel(8);
-        let sess = session.clone();
-        // Short keepalive interval for testing
-        let keepalive = Some(std::time::Duration::from_millis(100));
-        let handle = tokio::spawn(async move {
-            sess.recv_loop(
-                new_stream_tx,
-                Some(std::time::Duration::from_secs(300)),
-                keepalive,
-                CancellationToken::new(),
-            )
-            .await
-        });
+        /// Wrapper that can independently fail writes while reads still work.
+        struct FailableWriter {
+            inner: tokio::io::DuplexStream,
+            fail_writes: Arc<AtomicBool>,
+        }
 
-        // Client does NOT send anything — just listens.
-        // Server should proactively send HeartRequest within ~100ms.
-        let mut hdr_buf = [0u8; HEADER_SIZE];
-        let mut found_heart_request = false;
-        for _ in 0..10 {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(200),
-                client_io.read_exact(&mut hdr_buf),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {
-                    let hdr = FrameHeader::decode(&hdr_buf);
-                    if hdr.length > 0 {
-                        let mut skip = vec![0u8; hdr.length as usize];
-                        client_io.read_exact(&mut skip).await.unwrap();
-                    }
-                    if hdr.command == Command::HeartRequest {
-                        found_heart_request = true;
-                        break;
-                    }
-                }
-                _ => break,
+        impl AsyncRead for FailableWriter {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
             }
         }
-        assert!(
-            found_heart_request,
-            "server did not send proactive HeartRequest within keepalive interval"
-        );
 
-        drop(client_io);
-        let _ = handle.await;
-    }
+        impl AsyncWrite for FailableWriter {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                let this = self.get_mut();
+                if this.fail_writes.load(Ordering::Relaxed) {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "simulated write failure",
+                    )));
+                }
+                std::pin::Pin::new(&mut this.inner).poll_write(cx, buf)
+            }
 
-    /// Heartbeat frames should NOT reset the idle timer — connections without
-    /// real data traffic should still idle-timeout even if keepalive succeeds.
-    #[tokio::test]
-    async fn test_keepalive_does_not_prevent_idle_timeout() {
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                let this = self.get_mut();
+                if this.fail_writes.load(Ordering::Relaxed) {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "simulated flush failure",
+                    )));
+                }
+                std::pin::Pin::new(&mut this.inner).poll_flush(cx)
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+            }
+        }
+
         let (mut client_io, server_io) = duplex(65536);
+        let fail_writes = Arc::new(AtomicBool::new(false));
+        let failable = FailableWriter {
+            inner: server_io,
+            fail_writes: fail_writes.clone(),
+        };
         let padding = test_padding();
         let session = Arc::new(Session::new_server(
-            server_io,
+            failable,
             padding,
             SessionConfig::default(),
         ));
@@ -1342,50 +1223,57 @@ mod tests {
         )
         .await;
 
-        let (new_stream_tx, _) = tokio::sync::mpsc::channel(8);
+        // Create a stream so writer task is active
+        write_frame(&mut client_io, Command::Syn, 1, &[]).await;
+
+        let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
         let sess = session.clone();
-        // idle_timeout=200ms, keepalive=80ms — keepalive should fire before idle
         let handle = tokio::spawn(async move {
-            sess.recv_loop(
-                new_stream_tx,
-                Some(std::time::Duration::from_millis(200)),
-                Some(std::time::Duration::from_millis(80)),
-                CancellationToken::new(),
-            )
-            .await
+            sess.recv_loop(new_stream_tx, CancellationToken::new())
+                .await
         });
 
-        // Client responds to HeartRequest with HeartResponse (simulating real client)
-        let respond_task = tokio::spawn(async move {
-            let mut hdr_buf = [0u8; HEADER_SIZE];
+        let mut stream =
+            tokio::time::timeout(std::time::Duration::from_secs(1), new_stream_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+
+        // Stream can write initially
+        use tokio::io::AsyncWriteExt;
+        stream.write_all(b"hello").await.unwrap();
+
+        // Now fail all writes — simulates network disruption on write path
+        fail_writes.store(true, Ordering::Relaxed);
+
+        // Trigger writer task to encounter the error
+        // (may need a few attempts since writer might not pick up immediately)
+        for _ in 0..10 {
+            let _ = stream.write_all(b"trigger failure").await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Keep client sending PSH data — this does NOT cause recv_loop to
+        // write anything (it just dispatches to the stream channel).
+        // This keeps recv_loop alive on the read side.
+        let keepalive_task = tokio::spawn(async move {
             loop {
-                match client_io.read_exact(&mut hdr_buf).await {
-                    Ok(_) => {
-                        let hdr = FrameHeader::decode(&hdr_buf);
-                        if hdr.length > 0 {
-                            let mut skip = vec![0u8; hdr.length as usize];
-                            if client_io.read_exact(&mut skip).await.is_err() {
-                                break;
-                            }
-                        }
-                        if hdr.command == Command::HeartRequest {
-                            write_frame(&mut client_io, Command::HeartResponse, 0, &[]).await;
-                        }
-                    }
-                    Err(_) => break,
-                }
+                write_frame(&mut client_io, Command::Psh, 1, b"keep alive").await;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         });
 
-        // Heartbeat frames do NOT reset idle timeout, so despite keepalive
-        // succeeding, the session should still idle-timeout after 200ms.
+        // recv_loop should exit within 2 seconds after writer dies.
+        // Currently it will hang because writer dies silently and
+        // PSH handling doesn't require any writes.
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        keepalive_task.abort();
+
         assert!(
             result.is_ok(),
-            "session did not terminate — idle timeout should fire even with keepalive"
+            "recv_loop did not exit after writer task died — \
+             session stays half-alive, causing all streams to hang"
         );
-
-        respond_task.abort();
     }
 
     /// When one stream's channel is full, recv_loop must NOT block all other
@@ -1415,7 +1303,7 @@ mod tests {
         let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
         let sess = session.clone();
         let handle = tokio::spawn(async move {
-            sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
+            sess.recv_loop(new_stream_tx, CancellationToken::new())
                 .await
         });
 
@@ -1489,7 +1377,7 @@ mod tests {
         let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
         let sess = session.clone();
         let handle = tokio::spawn(async move {
-            sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
+            sess.recv_loop(new_stream_tx, CancellationToken::new())
                 .await
         });
 
@@ -1509,72 +1397,6 @@ mod tests {
 
         drop(client_io);
         let _ = handle.await;
-    }
-
-    /// RED: when the server sends HeartRequest but the client never responds,
-    /// the session should terminate within `heartbeat_timeout`.  Currently
-    /// recv_loop does not track outstanding heartbeats, so this test FAILS.
-    #[tokio::test]
-    async fn test_heartbeat_timeout_terminates_session() {
-        let (mut client_io, server_io) = duplex(65536);
-        let padding = test_padding();
-        let session = Arc::new(Session::new_server(
-            server_io,
-            padding,
-            SessionConfig::default(),
-        ));
-        let settings_data = format!("v=2\npadding-md5={}", session.padding_md5());
-        write_frame(
-            &mut client_io,
-            Command::Settings,
-            0,
-            settings_data.as_bytes(),
-        )
-        .await;
-
-        let (new_stream_tx, _) = tokio::sync::mpsc::channel(8);
-        let sess = session.clone();
-        // keepalive=50ms, heartbeat_timeout=100ms
-        // idle_timeout=10s (long enough to never fire)
-        let handle = tokio::spawn(async move {
-            sess.recv_loop(
-                new_stream_tx,
-                Some(std::time::Duration::from_secs(10)),
-                Some(std::time::Duration::from_millis(50)),
-                CancellationToken::new(),
-            )
-            .await
-        });
-
-        // Client reads frames but does NOT respond to HeartRequest.
-        let drain_task = tokio::spawn(async move {
-            let mut hdr_buf = [0u8; HEADER_SIZE];
-            loop {
-                match client_io.read_exact(&mut hdr_buf).await {
-                    Ok(_) => {
-                        let hdr = FrameHeader::decode(&hdr_buf);
-                        if hdr.length > 0 {
-                            let mut skip = vec![0u8; hdr.length as usize];
-                            if client_io.read_exact(&mut skip).await.is_err() {
-                                break;
-                            }
-                        }
-                        // Deliberately do NOT respond to HeartRequest
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        // The session should terminate within ~200ms (heartbeat_timeout
-        // after first unanswered HeartRequest at 50ms).
-        let result = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
-        drain_task.abort();
-        assert!(
-            result.is_ok(),
-            "session should terminate when HeartResponse is not received, \
-             but it stayed alive — heartbeat timeout not implemented"
-        );
     }
 
     /// RED test: Prove that the writer task's batched lock hold blocks control
@@ -1625,7 +1447,7 @@ mod tests {
         let sess = session.clone();
         let _recv_handle = tokio::spawn(async move {
             let _ = sess
-                .recv_loop(new_stream_tx, None, None, CancellationToken::new())
+                .recv_loop(new_stream_tx, CancellationToken::new())
                 .await;
         });
 
@@ -1807,7 +1629,7 @@ mod tests {
         let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
         let sess = session.clone();
         let handle = tokio::spawn(async move {
-            sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
+            sess.recv_loop(new_stream_tx, CancellationToken::new())
                 .await
         });
 
@@ -1898,7 +1720,7 @@ mod tests {
         let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
         let sess = session.clone(); // refcount +1
         let handle = tokio::spawn(async move {
-            sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
+            sess.recv_loop(new_stream_tx, CancellationToken::new())
                 .await
         });
 
@@ -1958,7 +1780,7 @@ mod tests {
         let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
         let sess = session.clone();
         let handle = tokio::spawn(async move {
-            sess.recv_loop(new_stream_tx, None, None, CancellationToken::new())
+            sess.recv_loop(new_stream_tx, CancellationToken::new())
                 .await
         });
 
@@ -2010,5 +1832,254 @@ mod tests {
 
         drop(client_io);
         let _ = handle.await;
+    }
+
+    /// Session must stay alive indefinitely when idle — no idle timeout should
+    /// kill it. This aligns with sing-anytls behavior where the server never
+    /// actively closes connections; lifecycle is managed by the client and TCP
+    /// keepalive.
+    #[tokio::test]
+    async fn test_session_stays_alive_when_idle() {
+        let (mut client_io, server_io) = duplex(65536);
+        let padding = test_padding();
+        let session = Arc::new(Session::new_server(
+            server_io,
+            padding,
+            SessionConfig::default(),
+        ));
+        let settings_data = format!("v=2\npadding-md5={}", session.padding_md5());
+        write_frame(
+            &mut client_io,
+            Command::Settings,
+            0,
+            settings_data.as_bytes(),
+        )
+        .await;
+
+        let (new_stream_tx, _) = tokio::sync::mpsc::channel(8);
+        let sess = session.clone();
+        let handle = tokio::spawn(async move {
+            sess.recv_loop(new_stream_tx, CancellationToken::new())
+                .await
+        });
+
+        // Wait 500ms with no activity — session must remain alive.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !handle.is_finished(),
+            "session terminated while idle — server must not actively close idle connections"
+        );
+
+        // Clean shutdown via connection close.
+        drop(client_io);
+        let _ = handle.await;
+    }
+
+    /// Session must NOT send HeartRequest frames. The server should be a passive
+    /// pipe that never initiates keepalive — aligning with sing-anytls behavior.
+    /// Only passive HeartResponse (replying to client HeartRequest) is allowed.
+    #[tokio::test]
+    async fn test_session_does_not_send_heartbeat() {
+        let (mut client_io, server_io) = duplex(65536);
+        let padding = test_padding();
+        let session = Arc::new(Session::new_server(
+            server_io,
+            padding,
+            SessionConfig::default(),
+        ));
+        let settings_data = format!("v=2\npadding-md5={}", session.padding_md5());
+        write_frame(
+            &mut client_io,
+            Command::Settings,
+            0,
+            settings_data.as_bytes(),
+        )
+        .await;
+
+        let (new_stream_tx, _) = tokio::sync::mpsc::channel(8);
+        let sess = session.clone();
+        let handle = tokio::spawn(async move {
+            sess.recv_loop(new_stream_tx, CancellationToken::new())
+                .await
+        });
+
+        // Wait 500ms — if server sends HeartRequest, we'll see it.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Try to read any frame from the server side. After Settings exchange,
+        // the server may send ServerSettings/UpdatePaddingScheme but must NOT
+        // send HeartRequest.
+        let mut found_heart_request = false;
+        loop {
+            let mut hdr_buf = [0u8; HEADER_SIZE];
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                client_io.read_exact(&mut hdr_buf),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    let hdr = FrameHeader::decode(&hdr_buf);
+                    if hdr.length > 0 {
+                        let mut skip = vec![0u8; hdr.length as usize];
+                        client_io.read_exact(&mut skip).await.unwrap();
+                    }
+                    if hdr.command == Command::HeartRequest {
+                        found_heart_request = true;
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(
+            !found_heart_request,
+            "server sent HeartRequest — server must not actively probe connections"
+        );
+
+        drop(client_io);
+        let _ = handle.await;
+    }
+
+    /// Data frame writes must NOT have a hard timeout. When the network is
+    /// congested, writes may take longer than 5s — the writer task should
+    /// wait patiently instead of killing the session. This aligns with
+    /// sing-anytls where writeDataFrame has no deadline.
+    /// Control frame writes (write_frame) should still have a timeout.
+    #[tokio::test]
+    async fn test_data_write_no_timeout() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{Context, Poll};
+        use tokio::io::ReadBuf;
+
+        /// Writer that delays writes by a configurable duration.
+        struct SlowWriter {
+            inner: tokio::io::DuplexStream,
+            slow: Arc<AtomicBool>,
+            wake_scheduled: Arc<AtomicBool>,
+        }
+
+        impl AsyncRead for SlowWriter {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+            }
+        }
+
+        impl AsyncWrite for SlowWriter {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                let this = self.get_mut();
+                if this.slow.load(Ordering::Relaxed) {
+                    // Return Pending to simulate a slow network. Schedule
+                    // exactly one wake task to avoid spawning on every poll.
+                    if !this.wake_scheduled.swap(true, Ordering::Relaxed) {
+                        let waker = cx.waker().clone();
+                        let slow = this.slow.clone();
+                        tokio::spawn(async move {
+                            // Wait 6 seconds — longer than WRITE_TIMEOUT (5s)
+                            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+                            slow.store(false, Ordering::Relaxed);
+                            waker.wake();
+                        });
+                    }
+                    return Poll::Pending;
+                }
+                std::pin::Pin::new(&mut this.inner).poll_write(cx, buf)
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+            }
+        }
+
+        let (mut client_io, server_io) = duplex(65536);
+        let slow = Arc::new(AtomicBool::new(false));
+        let slow_writer = SlowWriter {
+            inner: server_io,
+            slow: slow.clone(),
+            wake_scheduled: Arc::new(AtomicBool::new(false)),
+        };
+        let padding = test_padding();
+        let session = Arc::new(Session::new_server(
+            slow_writer,
+            padding,
+            SessionConfig::default(),
+        ));
+        let settings_data = format!("v=2\npadding-md5={}", session.padding_md5());
+        write_frame(
+            &mut client_io,
+            Command::Settings,
+            0,
+            settings_data.as_bytes(),
+        )
+        .await;
+        write_frame(&mut client_io, Command::Syn, 1, &[]).await;
+
+        let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
+        let sess = session.clone();
+        let handle = tokio::spawn(async move {
+            sess.recv_loop(new_stream_tx, CancellationToken::new())
+                .await
+        });
+
+        let mut stream =
+            tokio::time::timeout(std::time::Duration::from_secs(1), new_stream_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+
+        // Make the writer slow BEFORE writing data
+        slow.store(true, Ordering::Relaxed);
+
+        // Write data through the stream — this goes through the writer task
+        use tokio::io::AsyncWriteExt;
+        stream.write_all(b"slow data").await.unwrap();
+
+        // Drain the client side to receive the data (after the 6s delay)
+        let mut buf = [0u8; 64];
+        let drain = tokio::spawn(async move {
+            let mut total = Vec::new();
+            loop {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    client_io.read(&mut buf),
+                )
+                .await
+                {
+                    Ok(Ok(0)) | Err(_) => break,
+                    Ok(Ok(n)) => total.extend_from_slice(&buf[..n]),
+                    Ok(Err(_)) => break,
+                }
+            }
+            total
+        });
+
+        // Session must still be alive after 6s (past the old 5s WRITE_TIMEOUT)
+        tokio::time::sleep(std::time::Duration::from_secs(7)).await;
+        assert!(
+            !handle.is_finished(),
+            "session died due to write timeout — data frame writes must not have a hard timeout"
+        );
+
+        drop(stream);
+        let _ = handle.await;
+        let _ = drain.await;
     }
 }
