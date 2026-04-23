@@ -2,6 +2,7 @@ mod acl;
 mod business;
 mod config;
 mod logger;
+mod net;
 
 use logger::log;
 
@@ -134,9 +135,9 @@ async fn main() -> Result<()> {
     .on_user_diff(on_diff);
     let background_handle = background_tasks.start();
 
-    // Bind listener
-    let addr = format!("0.0.0.0:{}", remote_config.server_port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    // Bind listener (dual-stack: IPv4 + IPv6)
+    let listener = net::bind_dual_stack(remote_config.server_port)?;
+    let addr = listener.local_addr()?;
     log::info!(addr = %addr, "Listening");
 
     // Shutdown handler
