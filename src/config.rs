@@ -4,6 +4,20 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::business::IpVersion;
+
+fn parse_ip_version(s: &str) -> Result<IpVersion, String> {
+    match s.to_lowercase().as_str() {
+        "v4" | "ipv4" | "4" => Ok(IpVersion::V4),
+        "v6" | "ipv6" | "6" => Ok(IpVersion::V6),
+        "auto" | "dual" => Ok(IpVersion::Auto),
+        other => Err(format!(
+            "Invalid IP version '{}'. Use 'v4', 'v6', or 'auto'",
+            other
+        )),
+    }
+}
+
 fn parse_duration(s: &str) -> Result<Duration, String> {
     if let Ok(d) = humantime::parse_duration(s) {
         return Ok(d);
@@ -94,6 +108,16 @@ pub struct CliArgs {
         help_heading = "Performance"
     )]
     pub stream_channel_capacity: usize,
+
+    /// IP version preference for panel API connections (auto, v4, v6).
+    #[arg(
+        long,
+        env = "X_PANDA_ANYTLS_PANEL_IP_VERSION",
+        default_value = "v4",
+        value_parser = parse_ip_version,
+        help_heading = "Network"
+    )]
+    pub panel_ip_version: IpVersion,
 }
 
 impl CliArgs {
@@ -184,6 +208,7 @@ mod tests {
             refresh_geodata: false,
             write_buf_size: 32 * 1024,
             stream_channel_capacity: 128,
+            panel_ip_version: IpVersion::V4,
         }
     }
 
@@ -283,5 +308,39 @@ mod tests {
         let cli = create_test_cli_args();
         assert_eq!(cli.write_buf_size, 32 * 1024);
         assert_eq!(cli.stream_channel_capacity, 128);
+    }
+
+    #[test]
+    fn test_parse_ip_version_valid() {
+        let cases = [
+            ("v4", IpVersion::V4),
+            ("V4", IpVersion::V4),
+            ("ipv4", IpVersion::V4),
+            ("IPv4", IpVersion::V4),
+            ("4", IpVersion::V4),
+            ("v6", IpVersion::V6),
+            ("V6", IpVersion::V6),
+            ("ipv6", IpVersion::V6),
+            ("IPv6", IpVersion::V6),
+            ("6", IpVersion::V6),
+            ("auto", IpVersion::Auto),
+            ("Auto", IpVersion::Auto),
+            ("AUTO", IpVersion::Auto),
+            ("dual", IpVersion::Auto),
+            ("Dual", IpVersion::Auto),
+        ];
+        for (input, expected) in &cases {
+            assert_eq!(
+                parse_ip_version(input).unwrap(),
+                *expected,
+                "failed for input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_ip_version_invalid() {
+        assert!(parse_ip_version("invalid").is_err());
+        assert!(parse_ip_version("bad").is_err());
     }
 }

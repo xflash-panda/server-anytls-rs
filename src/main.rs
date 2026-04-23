@@ -43,6 +43,7 @@ async fn main() -> Result<()> {
         api_timeout: cli.api_timeout.as_secs(),
         debug: cli.log_mode == "debug",
         data_dir: cli.data_dir.clone(),
+        ip_version: cli.panel_ip_version,
     };
 
     let api_manager = Arc::new(ApiManager::new(panel_config)?);

@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 pub use panel_core::{
     BackgroundTasks, StatsCollector as PanelStatsCollector, TaskConfig, UserManager,
 };
-pub use panel_http::{HttpApiManager as ApiManager, HttpPanelConfig as PanelConfig};
+pub use panel_http::{HttpApiManager as ApiManager, HttpPanelConfig as PanelConfig, IpVersion};
 
 /// SHA-256 key derivation for AnyTLS protocol
 pub fn sha256_key(uuid: &str) -> [u8; 32] {
