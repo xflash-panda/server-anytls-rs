@@ -90,7 +90,10 @@ mod tests {
         let mut client = connect_result.expect("IPv6 connect failed");
         let (_, peer_addr) = accept_result.expect("IPv6 accept failed");
 
-        assert!(peer_addr.ip().is_loopback(), "expected loopback, got: {peer_addr}");
+        assert!(
+            peer_addr.ip().is_loopback(),
+            "expected loopback, got: {peer_addr}"
+        );
         client.shutdown().await.ok();
     }
 
