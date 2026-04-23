@@ -37,12 +37,7 @@ pub struct ServerConfig {
     pub max_connections: usize,
     pub max_streams_per_session: usize,
     pub tcp_connect_timeout: Duration,
-    pub idle_timeout: Duration,
     pub handshake_timeout: Duration,
-    /// Server-side keepalive interval. When set, the server proactively sends
-    /// HeartRequest frames at this interval to prevent NAT devices from
-    /// dropping idle connections.
-    pub keepalive_interval: Option<Duration>,
     /// BufWriter buffer size for the TLS write half (bytes).
     pub write_buf_size: usize,
     /// Per-stream data channel capacity (number of buffered messages).
@@ -55,9 +50,7 @@ impl Default for ServerConfig {
             max_connections: 10000,
             max_streams_per_session: 256,
             tcp_connect_timeout: Duration::from_secs(5),
-            idle_timeout: Duration::from_secs(300),
             handshake_timeout: Duration::from_secs(10),
-            keepalive_interval: Some(Duration::from_secs(60)),
             write_buf_size: DEFAULT_WRITE_BUF_SIZE,
             stream_channel_capacity: DEFAULT_STREAM_CHANNEL_CAPACITY,
         }
@@ -164,9 +157,7 @@ pub struct ServerBuilder {
     max_connections: usize,
     max_streams_per_session: usize,
     tcp_connect_timeout: Duration,
-    idle_timeout: Duration,
     handshake_timeout: Duration,
-    keepalive_interval: Option<Duration>,
     write_buf_size: usize,
     stream_channel_capacity: usize,
 }
@@ -184,9 +175,7 @@ impl ServerBuilder {
             max_connections: defaults.max_connections,
             max_streams_per_session: defaults.max_streams_per_session,
             tcp_connect_timeout: defaults.tcp_connect_timeout,
-            idle_timeout: defaults.idle_timeout,
             handshake_timeout: defaults.handshake_timeout,
-            keepalive_interval: defaults.keepalive_interval,
             write_buf_size: defaults.write_buf_size,
             stream_channel_capacity: defaults.stream_channel_capacity,
         }
@@ -237,18 +226,8 @@ impl ServerBuilder {
         self
     }
 
-    pub fn idle_timeout(mut self, d: Duration) -> Self {
-        self.idle_timeout = d;
-        self
-    }
-
     pub fn handshake_timeout(mut self, d: Duration) -> Self {
         self.handshake_timeout = d;
-        self
-    }
-
-    pub fn keepalive_interval(mut self, d: Option<Duration>) -> Self {
-        self.keepalive_interval = d;
         self
     }
 
@@ -282,9 +261,7 @@ impl ServerBuilder {
             max_connections: self.max_connections,
             max_streams_per_session: self.max_streams_per_session,
             tcp_connect_timeout: self.tcp_connect_timeout,
-            idle_timeout: self.idle_timeout,
             handshake_timeout: self.handshake_timeout,
-            keepalive_interval: self.keepalive_interval,
             write_buf_size: self.write_buf_size,
             stream_channel_capacity: self.stream_channel_capacity,
         };

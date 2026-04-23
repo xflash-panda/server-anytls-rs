@@ -54,11 +54,6 @@ pub struct CliArgs {
     #[arg(long, env = "X_PANDA_ANYTLS_HEARTBEAT_INTERVAL", default_value = "180s", value_parser = parse_duration)]
     pub heartbeat_interval: Duration,
 
-    /// Server-side keepalive interval to prevent NAT from dropping idle connections.
-    /// Set to "0s" to disable.
-    #[arg(long, env = "X_PANDA_ANYTLS_KEEPALIVE_INTERVAL", default_value = "60s", value_parser = parse_duration)]
-    pub keepalive_interval: Duration,
-
     #[arg(long, env = "X_PANDA_ANYTLS_API_TIMEOUT", default_value = "30s", value_parser = parse_duration)]
     pub api_timeout: Duration,
 
@@ -180,7 +175,6 @@ mod tests {
             fetch_users_interval: Duration::from_secs(60),
             report_traffics_interval: Duration::from_secs(80),
             heartbeat_interval: Duration::from_secs(180),
-            keepalive_interval: Duration::from_secs(60),
             api_timeout: Duration::from_secs(30),
             log_mode: "error".to_string(),
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
