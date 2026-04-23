@@ -116,14 +116,7 @@ pub(crate) async fn handle_connection(
         }
     });
 
-    session
-        .recv_loop(
-            new_stream_tx,
-            Some(server.config.idle_timeout),
-            server.config.keepalive_interval,
-            cancel_token,
-        )
-        .await
+    session.recv_loop(new_stream_tx, cancel_token).await
 }
 
 #[cfg(test)]

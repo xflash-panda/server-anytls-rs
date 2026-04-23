@@ -42,6 +42,7 @@ async fn main() -> Result<()> {
             .clone()
             .unwrap_or_else(|| cli.server_host.clone()),
         ca_cert_path: cli.ca_file.clone(),
+        ip_version: cli.panel_ip_version,
     };
 
     let api_manager = Arc::new(ApiManager::new(panel_config));
@@ -92,12 +93,6 @@ async fn main() -> Result<()> {
     let anytls_stats = Arc::new(AnyTlsStatsCollector(Arc::clone(&stats_collector)));
     let connection_manager = ConnectionManager::new();
 
-    let keepalive = if cli.keepalive_interval.is_zero() {
-        None
-    } else {
-        Some(cli.keepalive_interval)
-    };
-
     let mut builder = server_anytls_rs::Server::builder()
         .authenticator(authenticator)
         .stats(anytls_stats as Arc<dyn StatsCollector>)
@@ -106,8 +101,7 @@ async fn main() -> Result<()> {
         .connection_manager(connection_manager.clone())
         .max_connections(cli.max_connections)
         .write_buf_size(cli.write_buf_size)
-        .stream_channel_capacity(cli.stream_channel_capacity)
-        .keepalive_interval(keepalive);
+        .stream_channel_capacity(cli.stream_channel_capacity);
 
     if let Some(ref rules) = remote_config.padding_rules
         && !rules.is_empty()

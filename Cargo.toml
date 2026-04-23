@@ -1,6 +1,6 @@
 [package]
 name = "server-anytls-rs"
-version = "0.1.23"
+version = "0.1.30"
 edition = "2024"
 
 [[bin]]
@@ -37,8 +37,8 @@ time = { version = "0.3", features = ["formatting", "macros", "local-offset"] }
 acl-engine-rs = { git = "https://github.com/xflash-panda/acl-engine-rs.git", tag = "v0.4.4", features = ["async"] }
 
 # Panel Integration (connect-rpc via QUIC/H3)
-panel-core = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.8" }
-panel-connect-rpc = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.8" }
+panel-core = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.10" }
+panel-connect-rpc = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.10" }
 socket2 = "0.6"
 
 [dev-dependencies]
