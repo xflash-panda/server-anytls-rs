@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 
 // Re-export panel types used by main.rs
 pub use panel_connect_rpc::{
-    ConnectRpcApiManager as ApiManager, ConnectRpcPanelConfig as PanelConfig,
+    ConnectRpcApiManager as ApiManager, ConnectRpcPanelConfig as PanelConfig, IpVersion,
 };
 pub use panel_core::{
     BackgroundTasks, NodeType, StatsCollector as PanelStatsCollector, TaskConfig, UserManager,

@@ -4,6 +4,8 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::business::IpVersion;
+
 fn parse_duration(s: &str) -> Result<Duration, String> {
     if let Ok(d) = humantime::parse_duration(s) {
         return Ok(d);
@@ -14,6 +16,18 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
             s
         )
     })
+}
+
+fn parse_ip_version(s: &str) -> Result<IpVersion, String> {
+    match s.to_lowercase().as_str() {
+        "v4" | "ipv4" | "4" => Ok(IpVersion::V4),
+        "v6" | "ipv6" | "6" => Ok(IpVersion::V6),
+        "auto" | "dual" => Ok(IpVersion::Auto),
+        other => Err(format!(
+            "Invalid IP version '{}'. Use 'v4', 'v6', or 'auto'",
+            other
+        )),
+    }
 }
 
 const DEFAULT_DATA_DIR: &str = "/var/lib/anytls-agent-node";
@@ -94,6 +108,11 @@ pub struct CliArgs {
 
     #[arg(long, env = "X_PANDA_ANYTLS_REFRESH_GEODATA", default_value_t = false)]
     pub refresh_geodata: bool,
+
+    /// IP version preference for panel API connections (v4, v6, auto)
+    #[arg(long, env = "X_PANDA_ANYTLS_PANEL_IP_VERSION", default_value = "v4",
+           value_parser = parse_ip_version, help_heading = "Network")]
+    pub panel_ip_version: IpVersion,
 
     // --- Performance tuning ---
     /// Maximum number of concurrent connections.
@@ -202,6 +221,7 @@ mod tests {
             block_private_ip: true,
             max_connections: 10000,
             refresh_geodata: false,
+            panel_ip_version: IpVersion::V4,
             server_name: None,
             ca_file: None,
             write_buf_size: 32 * 1024,
@@ -336,5 +356,34 @@ mod tests {
         let cli = create_test_cli_args();
         assert_eq!(cli.write_buf_size, 32 * 1024);
         assert_eq!(cli.stream_channel_capacity, 128);
+    }
+
+    #[test]
+    fn test_parse_ip_version_valid() {
+        for (input, expected) in [
+            ("v4", IpVersion::V4),
+            ("ipv4", IpVersion::V4),
+            ("4", IpVersion::V4),
+            ("V4", IpVersion::V4),
+            ("v6", IpVersion::V6),
+            ("ipv6", IpVersion::V6),
+            ("6", IpVersion::V6),
+            ("auto", IpVersion::Auto),
+            ("dual", IpVersion::Auto),
+        ] {
+            assert_eq!(
+                parse_ip_version(input).unwrap(),
+                expected,
+                "input: {}",
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_ip_version_invalid() {
+        for input in ["", "v5", "invalid", "ip4"] {
+            assert!(parse_ip_version(input).is_err(), "input: {}", input);
+        }
     }
 }

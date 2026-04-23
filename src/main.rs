@@ -42,6 +42,7 @@ async fn main() -> Result<()> {
             .clone()
             .unwrap_or_else(|| cli.server_host.clone()),
         ca_cert_path: cli.ca_file.clone(),
+        ip_version: cli.panel_ip_version,
     };
 
     let api_manager = Arc::new(ApiManager::new(panel_config));

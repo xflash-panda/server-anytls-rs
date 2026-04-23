@@ -233,7 +233,10 @@ pub(crate) async fn handle_udp_over_tcp<T: AsyncRead + AsyncWrite + Unpin + Send
         } else {
             "rejected"
         };
-        warn!("rejecting UDP connection to {} ({reason})", request.destination);
+        warn!(
+            "rejecting UDP connection to {} ({reason})",
+            request.destination
+        );
         session.handshake_failure(stream_id, "rejected").await?;
         return Ok(());
     }

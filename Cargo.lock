@@ -1569,8 +1569,8 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "panel-connect-rpc"
-version = "0.1.8"
-source = "git+https://github.com/xflash-panda/server-panel-rs?tag=v0.1.8#2615047b548c8c3f1f35d4c05de0aa27a3e9ccb6"
+version = "0.1.10"
+source = "git+https://github.com/xflash-panda/server-panel-rs?tag=v0.1.10#f20af7eec60339a9010fe88cb339bb614af14baa"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1588,8 +1588,8 @@ dependencies = [
 
 [[package]]
 name = "panel-core"
-version = "0.1.8"
-source = "git+https://github.com/xflash-panda/server-panel-rs?tag=v0.1.8#2615047b548c8c3f1f35d4c05de0aa27a3e9ccb6"
+version = "0.1.9"
+source = "git+https://github.com/xflash-panda/server-panel-rs?tag=v0.1.10#f20af7eec60339a9010fe88cb339bb614af14baa"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2245,7 +2245,7 @@ dependencies = [
 
 [[package]]
 name = "server-anytls-rs"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "acl-engine-rs",
  "anyhow",
@@ -2285,8 +2285,8 @@ dependencies = [
 
 [[package]]
 name = "server-client-rs"
-version = "0.1.13"
-source = "git+https://github.com/xflash-panda/server-client-rs.git?tag=v0.1.13#004c7667e0067a37fb4d41ba7c56c7ecd85711c6"
+version = "0.1.14"
+source = "git+https://github.com/xflash-panda/server-client-rs.git?tag=v0.1.14#f7f59b3e60808158cf86fb044b5b7bff11409864"
 dependencies = [
  "reqwest",
  "serde",
