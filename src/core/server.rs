@@ -13,10 +13,10 @@ use crate::core::session::{
     DEFAULT_STREAM_CHANNEL_CAPACITY, DEFAULT_WRITE_BUF_SIZE, SessionConfig,
 };
 
-/// Enable TCP keepalive on an accepted connection to match Go's default
+/// Enable TCP keepalive on a connection to match Go's default
 /// behavior (SO_KEEPALIVE + 30s interval). Without this, dead connections
 /// hang for 30s–2min during TCP retransmission timeout before being detected.
-fn set_tcp_keepalive(stream: &tokio::net::TcpStream) {
+pub(crate) fn set_tcp_keepalive(stream: &tokio::net::TcpStream) {
     let sock = socket2::SockRef::from(stream);
     let _ = sock.set_keepalive(true);
     // TCP_KEEPIDLE=30s (when to start probes), TCP_KEEPINTVL=10s (probe interval).
@@ -42,6 +42,10 @@ pub struct ServerConfig {
     pub write_buf_size: usize,
     /// Per-stream data channel capacity (number of buffered messages).
     pub stream_channel_capacity: usize,
+    /// Maximum time a relay (`copy_bidirectional`) may be idle (no bytes
+    /// transferred in either direction) before it is forcibly terminated.
+    /// Prevents zombie connections when outbound targets become unresponsive.
+    pub relay_idle_timeout: Duration,
 }
 
 impl Default for ServerConfig {
@@ -53,6 +57,7 @@ impl Default for ServerConfig {
             handshake_timeout: Duration::from_secs(10),
             write_buf_size: DEFAULT_WRITE_BUF_SIZE,
             stream_channel_capacity: DEFAULT_STREAM_CHANNEL_CAPACITY,
+            relay_idle_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -160,6 +165,7 @@ pub struct ServerBuilder {
     handshake_timeout: Duration,
     write_buf_size: usize,
     stream_channel_capacity: usize,
+    relay_idle_timeout: Duration,
 }
 
 impl ServerBuilder {
@@ -178,6 +184,7 @@ impl ServerBuilder {
             handshake_timeout: defaults.handshake_timeout,
             write_buf_size: defaults.write_buf_size,
             stream_channel_capacity: defaults.stream_channel_capacity,
+            relay_idle_timeout: defaults.relay_idle_timeout,
         }
     }
 
@@ -241,6 +248,11 @@ impl ServerBuilder {
         self
     }
 
+    pub fn relay_idle_timeout(mut self, d: Duration) -> Self {
+        self.relay_idle_timeout = d;
+        self
+    }
+
     pub fn build(self) -> anyhow::Result<Server> {
         let authenticator = self
             .authenticator
@@ -264,6 +276,7 @@ impl ServerBuilder {
             handshake_timeout: self.handshake_timeout,
             write_buf_size: self.write_buf_size,
             stream_channel_capacity: self.stream_channel_capacity,
+            relay_idle_timeout: self.relay_idle_timeout,
         };
 
         let semaphore = Arc::new(Semaphore::new(config.max_connections));
@@ -311,6 +324,7 @@ mod tests {
         assert_eq!(server.config.max_connections, 10000);
         assert_eq!(server.config.max_streams_per_session, 256);
         assert_eq!(server.config.handshake_timeout, Duration::from_secs(10));
+        assert_eq!(server.config.relay_idle_timeout, Duration::from_secs(60));
     }
 
     #[test]

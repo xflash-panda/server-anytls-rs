@@ -3,6 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
@@ -119,6 +120,7 @@ pub(crate) async fn handle_stream<T: AsyncRead + AsyncWrite + Unpin + Send + 'st
     session: Arc<Session<T>>,
     mut stream: Stream,
     user_id: UserId,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     // Read the first chunk from the stream to get the SOCKS5 destination address.
     let mut buf = vec![0u8; 512];
@@ -143,13 +145,15 @@ pub(crate) async fn handle_stream<T: AsyncRead + AsyncWrite + Unpin + Send + 'st
     match outbound {
         OutboundType::Direct { resolved } => {
             proxy_tcp(
-                server, session, stream, &target, trailing, user_id, resolved,
+                server, session, stream, &target, trailing, user_id, resolved, cancel,
             )
             .await
         }
         OutboundType::Proxy(handler) => {
-            proxy_tcp_via_handler(server, session, stream, &target, trailing, user_id, handler)
-                .await
+            proxy_tcp_via_handler(
+                server, session, stream, &target, trailing, user_id, handler, cancel,
+            )
+            .await
         }
         OutboundType::Reject => {
             warn!("rejecting connection to {}", target);
@@ -161,6 +165,7 @@ pub(crate) async fn handle_stream<T: AsyncRead + AsyncWrite + Unpin + Send + 'st
 }
 
 /// Connect directly to `target` and relay data.
+#[allow(clippy::too_many_arguments)]
 async fn proxy_tcp<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     server: Arc<Server>,
     session: Arc<Session<T>>,
@@ -169,6 +174,7 @@ async fn proxy_tcp<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     trailing: Vec<u8>,
     user_id: UserId,
     resolved: Option<Arc<[std::net::SocketAddr]>>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     let stream_id = stream.id();
 
@@ -198,10 +204,11 @@ async fn proxy_tcp<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     };
 
     session.handshake_success(stream_id).await?;
-    relay_and_record(server, stream, remote, trailing, user_id).await
+    relay_and_record(server, stream, remote, trailing, user_id, cancel).await
 }
 
 /// Connect via an ACL outbound handler (Socks5, Http, etc.) and relay data.
+#[allow(clippy::too_many_arguments)]
 async fn proxy_tcp_via_handler<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     server: Arc<Server>,
     session: Arc<Session<T>>,
@@ -210,6 +217,7 @@ async fn proxy_tcp_via_handler<T: AsyncRead + AsyncWrite + Unpin + Send + 'stati
     trailing: Vec<u8>,
     user_id: UserId,
     handler: Arc<dyn acl_engine_rs::outbound::AsyncOutbound>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     use acl_engine_rs::outbound::Addr;
 
@@ -242,7 +250,7 @@ async fn proxy_tcp_via_handler<T: AsyncRead + AsyncWrite + Unpin + Send + 'stati
     };
 
     session.handshake_success(stream_id).await?;
-    relay_and_record(server, stream, remote, trailing, user_id).await
+    relay_and_record(server, stream, remote, trailing, user_id, cancel).await
 }
 
 /// Bidirectional relay between client stream and remote, with byte counting and
@@ -253,6 +261,7 @@ async fn relay_and_record<R>(
     mut remote: R,
     trailing: Vec<u8>,
     user_id: UserId,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()>
 where
     R: AsyncRead + AsyncWrite + Unpin,
@@ -278,13 +287,41 @@ where
         bytes_written: download_bytes.clone(),
     };
 
-    let _relay_result = tokio::io::copy_bidirectional_with_sizes(
+    let idle_timeout = server.config.relay_idle_timeout;
+
+    let idle_watchdog = async {
+        let check_interval = std::cmp::max(idle_timeout / 10, Duration::from_secs(1));
+        let mut prev_up = upload_bytes.load(Ordering::Relaxed);
+        let mut prev_down = download_bytes.load(Ordering::Relaxed);
+        let mut idle_since = tokio::time::Instant::now();
+
+        loop {
+            tokio::time::sleep(check_interval).await;
+            let cur_up = upload_bytes.load(Ordering::Relaxed);
+            let cur_down = download_bytes.load(Ordering::Relaxed);
+            if cur_up != prev_up || cur_down != prev_down {
+                prev_up = cur_up;
+                prev_down = cur_down;
+                idle_since = tokio::time::Instant::now();
+            } else if idle_since.elapsed() >= idle_timeout {
+                tracing::debug!("relay idle for {:?}, terminating session", idle_timeout);
+                cancel.cancel();
+                return;
+            }
+        }
+    };
+
+    let relay = tokio::io::copy_bidirectional_with_sizes(
         &mut counted_stream,
         &mut counted_remote,
         RELAY_BUF_SIZE,
         RELAY_BUF_SIZE,
-    )
-    .await;
+    );
+
+    tokio::select! {
+        _ = relay => {}
+        _ = idle_watchdog => {}
+    }
 
     let up = upload_bytes.load(Ordering::Relaxed) + trailing_len;
     let down = download_bytes.load(Ordering::Relaxed);
@@ -319,6 +356,7 @@ async fn connect_target(
             match TcpStream::connect(addr).await {
                 Ok(stream) => {
                     let _ = stream.set_nodelay(true);
+                    crate::core::server::set_tcp_keepalive(&stream);
                     return Ok(stream);
                 }
                 Err(e) => last_err = Some(e),
@@ -339,6 +377,7 @@ async fn connect_target(
         Address::Domain(host, port) => TcpStream::connect((host.as_str(), *port)).await?,
     };
     let _ = stream.set_nodelay(true);
+    crate::core::server::set_tcp_keepalive(&stream);
     Ok(stream)
 }
 
@@ -346,6 +385,7 @@ async fn connect_target(
 mod tests {
     use super::*;
     use crate::core::hooks::Address;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn test_parse_socks_addr_ipv4() {
@@ -506,7 +546,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(data_tx);
 
-        let _ = handle_stream(server, session, stream, 42).await;
+        let _ = handle_stream(server, session, stream, 42, CancellationToken::new()).await;
 
         let up = recording.upload.load(Ordering::Relaxed);
         let down = recording.download.load(Ordering::Relaxed);
@@ -574,7 +614,7 @@ mod tests {
             .unwrap();
         drop(data_tx); // EOF → copy_bidirectional finishes
 
-        let _ = handle_stream(server, session, stream, 42).await;
+        let _ = handle_stream(server, session, stream, 42, CancellationToken::new()).await;
 
         let up = recording.upload.load(Ordering::Relaxed);
         let down = recording.download.load(Ordering::Relaxed);

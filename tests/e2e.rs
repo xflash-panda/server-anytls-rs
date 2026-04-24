@@ -141,6 +141,108 @@ async fn read_frame(reader: &mut (impl AsyncReadExt + Unpin)) -> Option<(FrameHe
     Some((header, data))
 }
 
+/// Start a "black hole" server that accepts TCP connections but never
+/// reads or writes — simulates an unresponsive remote host.
+/// Returns (port, cancel_token, held_connections).
+async fn start_blackhole_server() -> (
+    u16,
+    CancellationToken,
+    Arc<tokio::sync::Mutex<Vec<TcpStream>>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    let connections: Arc<tokio::sync::Mutex<Vec<TcpStream>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let conns = connections.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel_clone.cancelled() => break,
+                result = listener.accept() => {
+                    if let Ok((stream, _)) = result {
+                        conns.lock().await.push(stream);
+                    }
+                }
+            }
+        }
+    });
+    (port, cancel, connections)
+}
+
+/// Open an AnyTLS connection that sends a stream to `blackhole_port`.
+/// The relay (`copy_bidirectional`) will hang because the black hole never responds.
+async fn open_stuck_connection(
+    connector: &TlsConnector,
+    server_port: u16,
+    blackhole_port: u16,
+    padding_md5: &str,
+) -> tokio_rustls::client::TlsStream<TcpStream> {
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let tcp = TcpStream::connect(format!("127.0.0.1:{server_port}"))
+        .await
+        .unwrap();
+    let mut tls = connector.connect(server_name, tcp).await.unwrap();
+
+    tls.write_all(&make_auth_packet(PASSWORD)).await.unwrap();
+    let settings_data = format!("v=2\npadding-md5={padding_md5}");
+    tls.write_all(&encode_frame(
+        Command::Settings,
+        0,
+        settings_data.as_bytes(),
+    ))
+    .await
+    .unwrap();
+    tls.flush().await.unwrap();
+
+    for _ in 0..5 {
+        if let Some((hdr, _)) = read_frame(&mut tls).await
+            && hdr.command == Command::ServerSettings
+        {
+            break;
+        }
+    }
+
+    tls.write_all(&encode_frame(Command::Syn, 1, &[]))
+        .await
+        .unwrap();
+
+    let mut psh_payload = socks5_ipv4_addr([127, 0, 0, 1], blackhole_port);
+    psh_payload.extend_from_slice(b"trigger-relay");
+    tls.write_all(&encode_frame(Command::Psh, 1, &psh_payload))
+        .await
+        .unwrap();
+    tls.flush().await.unwrap();
+
+    for _ in 0..5 {
+        if let Some((hdr, _)) = read_frame(&mut tls).await
+            && hdr.command == Command::SynAck
+        {
+            break;
+        }
+    }
+
+    tls
+}
+
+/// Try to complete a TLS handshake to the server within the given timeout.
+/// Returns Ok(()) if successful, Err if timeout or connection failure.
+async fn try_connect_tls(
+    tls_client_config: &Arc<rustls::ClientConfig>,
+    server_port: u16,
+    timeout: Duration,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let connector = TlsConnector::from(tls_client_config.clone());
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    tokio::time::timeout(timeout, async {
+        let tcp = TcpStream::connect(format!("127.0.0.1:{server_port}")).await?;
+        let _tls = connector.connect(server_name, tcp).await?;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    })
+    .await?
+}
+
 #[tokio::test]
 async fn test_full_e2e_echo() {
     // 1. Start echo server
@@ -468,6 +570,159 @@ async fn test_tls_session_resumption() {
     shutdown.cancel();
 }
 
+/// Reproduce the "zombie server" bug: when outbound targets become
+/// unresponsive (accept TCP but never read/write), `copy_bidirectional`
+/// in the relay hangs indefinitely. Each stuck relay holds a semaphore
+/// permit (from the accept loop). Once all permits are consumed, the
+/// server can no longer accept new connections — it appears dead even
+/// though the process is still running.
+///
+/// Root cause: no idle/relay timeout on `copy_bidirectional`, no TCP
+/// keepalive on outbound connections, and no session-level lifetime limit.
+///
+/// This test uses max_connections=2 to make the issue reproducible quickly:
+/// 1. Start a "black hole" server that accepts TCP but never responds.
+/// 2. Open 2 AnyTLS connections, each opening a stream to the black hole.
+/// 3. copy_bidirectional hangs → permits are never released.
+/// 4. A 3rd connection attempt should time out (server is zombie).
+/// 5. Wait 3 seconds to prove it never recovers on its own.
+#[tokio::test]
+async fn test_blackhole_outbound_causes_zombie_server() {
+    let (blackhole_port, blackhole_cancel, blackhole_connections) = start_blackhole_server().await;
+
+    let (tls_server_config, tls_client_config) = make_tls_configs();
+    let padding = PaddingFactory::new(DEFAULT_SCHEME).unwrap();
+    let padding_md5 = padding.md5_hex().to_string();
+
+    let server = Arc::new(
+        Server::builder()
+            .authenticator(Arc::new(SinglePasswordAuth::new(PASSWORD)))
+            .router(Arc::new(DirectRouter))
+            .tls_config(tls_server_config)
+            .max_connections(2)
+            .build()
+            .unwrap(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_port = listener.local_addr().unwrap().port();
+    let shutdown = CancellationToken::new();
+    let shutdown_clone = shutdown.clone();
+
+    tokio::spawn(async move {
+        let _ = server.run(listener, shutdown_clone).await;
+    });
+
+    let connector = TlsConnector::from(tls_client_config.clone());
+
+    // Open 2 connections stuck on the black hole → exhaust permits
+    let mut stuck_conns = Vec::new();
+    for _ in 0..2 {
+        let tls =
+            open_stuck_connection(&connector, server_port, blackhole_port, &padding_md5).await;
+        stuck_conns.push(tls);
+    }
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Server is zombie — 3rd connection cannot complete
+    assert!(
+        try_connect_tls(&tls_client_config, server_port, Duration::from_millis(500))
+            .await
+            .is_err(),
+        "server should be zombie: 3rd connection must not complete \
+         when all permits are consumed by stuck relays"
+    );
+
+    // Wait 3 seconds — still zombie (no recovery mechanism)
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    assert!(
+        try_connect_tls(&tls_client_config, server_port, Duration::from_millis(500))
+            .await
+            .is_err(),
+        "server should STILL be zombie after 3 seconds — no automatic \
+         recovery mechanism exists for stuck copy_bidirectional relays"
+    );
+
+    drop(stuck_conns);
+    blackhole_cancel.cancel();
+    drop(blackhole_connections);
+    shutdown.cancel();
+}
+
+/// GREEN: With `relay_idle_timeout` configured, stuck relays are terminated
+/// after the idle period expires, releasing semaphore permits so the server
+/// can accept new connections again — proving recovery from the zombie state.
+///
+/// Same setup as `test_blackhole_outbound_causes_zombie_server` but with a
+/// short `relay_idle_timeout(2s)`. After the timeout fires, stuck relays are
+/// killed, permits are freed, and new connections succeed.
+#[tokio::test]
+async fn test_blackhole_outbound_recovers_with_idle_timeout() {
+    let (blackhole_port, blackhole_cancel, blackhole_connections) = start_blackhole_server().await;
+
+    let (tls_server_config, tls_client_config) = make_tls_configs();
+    let padding = PaddingFactory::new(DEFAULT_SCHEME).unwrap();
+    let padding_md5 = padding.md5_hex().to_string();
+
+    let server = Arc::new(
+        Server::builder()
+            .authenticator(Arc::new(SinglePasswordAuth::new(PASSWORD)))
+            .router(Arc::new(DirectRouter))
+            .tls_config(tls_server_config)
+            .max_connections(2)
+            .relay_idle_timeout(Duration::from_secs(2))
+            .build()
+            .unwrap(),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_port = listener.local_addr().unwrap().port();
+    let shutdown = CancellationToken::new();
+    let shutdown_clone = shutdown.clone();
+
+    tokio::spawn(async move {
+        let _ = server.run(listener, shutdown_clone).await;
+    });
+
+    let connector = TlsConnector::from(tls_client_config.clone());
+
+    // Open 2 stuck connections → exhaust permits
+    let mut stuck_conns = Vec::new();
+    for _ in 0..2 {
+        let tls =
+            open_stuck_connection(&connector, server_port, blackhole_port, &padding_md5).await;
+        stuck_conns.push(tls);
+    }
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Confirm zombie state
+    assert!(
+        try_connect_tls(&tls_client_config, server_port, Duration::from_millis(500))
+            .await
+            .is_err(),
+        "server should initially be zombie with all permits consumed"
+    );
+
+    // Wait for relay_idle_timeout (2s) + margin for watchdog check interval
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    // Server should have recovered — new connection succeeds
+    assert!(
+        try_connect_tls(&tls_client_config, server_port, Duration::from_secs(2))
+            .await
+            .is_ok(),
+        "server should recover after relay_idle_timeout kills stuck relays"
+    );
+
+    drop(stuck_conns);
+    blackhole_cancel.cancel();
+    drop(blackhole_connections);
+    shutdown.cancel();
+}
+
 /// Verify that max_connections is strictly enforced at the accept loop level.
 /// The semaphore is acquired before spawning, so the accept loop blocks when
 /// all permits are held and new connections queue in the kernel TCP backlog.
@@ -477,6 +732,7 @@ async fn test_tls_session_resumption() {
 #[tokio::test]
 async fn test_max_connections_enforced() {
     let (tls_server_config, tls_client_config) = make_tls_configs();
+
     let padding = PaddingFactory::new(DEFAULT_SCHEME).unwrap();
     let padding_md5 = padding.md5_hex().to_string();
 
