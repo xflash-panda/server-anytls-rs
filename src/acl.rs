@@ -429,6 +429,15 @@ impl OutboundHandler {
         matches!(self, OutboundHandler::Reject(_))
     }
 
+    /// Check if this handler routes through a proxy (SOCKS5 or HTTP)
+    #[allow(dead_code)]
+    pub fn is_proxy(&self) -> bool {
+        matches!(
+            self,
+            OutboundHandler::Socks5 { .. } | OutboundHandler::Http(_)
+        )
+    }
+
     /// Check if this handler allows UDP
     #[allow(dead_code)]
     pub fn allows_udp(&self) -> bool {
@@ -755,6 +764,11 @@ impl AclRouter {
 
 impl AclRouter {
     /// Shared routing logic parameterized by protocol.
+    ///
+    /// ACL matching runs first (pure string matching, no I/O) so that proxied
+    /// and rejected domains return immediately without DNS resolution.  DNS is
+    /// only needed for direct routes (to reuse the result in connect_target()
+    /// and to enforce block_private_ip).
     async fn route_with_protocol(
         &self,
         addr: &server_anytls_rs::Address,
@@ -762,9 +776,7 @@ impl AclRouter {
     ) -> server_anytls_rs::OutboundType {
         use server_anytls_rs::{Address, OutboundType};
 
-        // Resolved addresses from DNS lookup (reused to avoid duplicate resolution).
-        let mut resolved_addrs: Option<Arc<[std::net::SocketAddr]>> = None;
-
+        // 1. Fast-reject private IP literals (no DNS involved).
         match addr {
             Address::IPv4(ip, _) if self.block_private_ip && is_private_ipv4(ip) => {
                 log::debug!(target = %addr, "Blocked private IPv4 address");
@@ -774,56 +786,58 @@ impl AclRouter {
                 log::debug!(target = %addr, "Blocked private IPv6 address");
                 return OutboundType::Reject;
             }
-            Address::Domain(host, _) => {
-                // Resolve domain (cached) so connect_target() can reuse the result.
-                if let Some(addrs) = self.resolve_domain(host).await {
-                    // Check for private IP if blocking is enabled.
-                    if self.block_private_ip {
-                        for resolved in addrs.iter() {
-                            match resolved.ip() {
-                                std::net::IpAddr::V4(ip) => {
-                                    let octets = ip.octets();
-                                    if is_private_ipv4(&octets) {
-                                        log::debug!(target = %addr, resolved = %ip, "Blocked domain resolving to private IPv4");
-                                        return OutboundType::Reject;
-                                    }
+            _ => {}
+        }
+
+        // 2. ACL match first — pure string matching, no DNS involved.
+        let host = addr.host_str();
+        let port = addr.port();
+        let acl_result = self.engine.match_host(&host, port, protocol);
+
+        // 3. Proxy/Reject: return immediately, no DNS needed.
+        if let Some(handler) = acl_result {
+            if handler.is_proxy() {
+                return OutboundType::Proxy(handler);
+            }
+            if handler.is_reject() {
+                return OutboundType::Reject;
+            }
+        }
+
+        // 4. Direct route: resolve DNS + enforce block_private_ip.
+        let mut resolved_addrs: Option<Arc<[std::net::SocketAddr]>> = None;
+
+        if let Address::Domain(domain, _) = addr {
+            if let Some(addrs) = self.resolve_domain(domain).await {
+                if self.block_private_ip {
+                    for resolved in addrs.iter() {
+                        match resolved.ip() {
+                            std::net::IpAddr::V4(ip) => {
+                                let octets = ip.octets();
+                                if is_private_ipv4(&octets) {
+                                    log::debug!(target = %addr, resolved = %ip, "Blocked domain resolving to private IPv4");
+                                    return OutboundType::Reject;
                                 }
-                                std::net::IpAddr::V6(ip) => {
-                                    let octets = ip.octets();
-                                    if is_private_ipv6(&octets) {
-                                        log::debug!(target = %addr, resolved = %ip, "Blocked domain resolving to private IPv6");
-                                        return OutboundType::Reject;
-                                    }
+                            }
+                            std::net::IpAddr::V6(ip) => {
+                                let octets = ip.octets();
+                                if is_private_ipv6(&octets) {
+                                    log::debug!(target = %addr, resolved = %ip, "Blocked domain resolving to private IPv6");
+                                    return OutboundType::Reject;
                                 }
                             }
                         }
                     }
-                    resolved_addrs = Some(addrs);
-                } else if self.block_private_ip {
-                    log::debug!(target = %addr, "Blocked domain with unresolvable DNS (fail-closed)");
-                    return OutboundType::Reject;
                 }
+                resolved_addrs = Some(addrs);
+            } else if self.block_private_ip {
+                log::debug!(target = %addr, "Blocked domain with unresolvable DNS (fail-closed)");
+                return OutboundType::Reject;
             }
-            _ => {}
         }
 
-        // Extract host string for ACL matching (Cow avoids allocation for Domain)
-        let host = addr.host_str();
-        let port = addr.port();
-
-        match self.engine.match_host(&host, port, protocol) {
-            Some(handler) => match &*handler {
-                OutboundHandler::Direct(_) => OutboundType::Direct {
-                    resolved: resolved_addrs,
-                },
-                OutboundHandler::Socks5 { .. } | OutboundHandler::Http(_) => {
-                    OutboundType::Proxy(handler)
-                }
-                OutboundHandler::Reject(_) => OutboundType::Reject,
-            },
-            None => OutboundType::Direct {
-                resolved: resolved_addrs,
-            },
+        OutboundType::Direct {
+            resolved: resolved_addrs,
         }
     }
 }
@@ -2031,6 +2045,57 @@ acl:
         assert!(
             matches!(result, OutboundType::Direct { .. }),
             "expected Direct when DNS fails with block_private_ip=false, got {:?}",
+            result
+        );
+    }
+
+    /// Helper: inject a DNS failure (empty result) into the router's cache for a domain.
+    async fn inject_dns_failure(router: &AclRouter, domain: &str) {
+        let empty_addrs: Arc<[std::net::SocketAddr]> = Arc::from([]);
+        router
+            .dns_cache
+            .insert(domain.to_string(), empty_addrs)
+            .await;
+    }
+
+    /// Proxied domains must skip DNS resolution entirely — even if DNS would
+    /// fail, the route should still return Proxy (not Reject).
+    #[tokio::test]
+    async fn test_proxied_domain_skips_dns_resolution() {
+        use server_anytls_rs::{Address, OutboundRouter, OutboundType};
+
+        let config = AclConfig {
+            outbounds: vec![OutboundEntry {
+                name: "warp".to_string(),
+                outbound_type: "socks5".to_string(),
+                socks5: Some(Socks5Config {
+                    addr: "127.0.0.1:40000".to_string(),
+                    username: None,
+                    password: None,
+                    allow_udp: true,
+                }),
+                http: None,
+                direct: None,
+            }],
+            acl: AclRules {
+                inline: vec![
+                    "warp(suffix:google.com)".to_string(),
+                    "direct(all)".to_string(),
+                ],
+            },
+        };
+
+        let engine = AclEngine::new(config, None, false).await.unwrap();
+        let router = AclRouter::with_block_private_ip(engine, true);
+
+        // Inject DNS failure for www.google.com
+        inject_dns_failure(&router, "www.google.com").await;
+
+        let addr = Address::Domain("www.google.com".to_string(), 443);
+        let result = router.route(&addr).await;
+        assert!(
+            matches!(result, OutboundType::Proxy(_)),
+            "expected Proxy for proxied domain even with DNS failure, got {:?}",
             result
         );
     }
