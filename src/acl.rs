@@ -432,7 +432,10 @@ impl OutboundHandler {
     /// Check if this handler routes through a proxy (SOCKS5 or HTTP)
     #[allow(dead_code)]
     pub fn is_proxy(&self) -> bool {
-        matches!(self, OutboundHandler::Socks5 { .. } | OutboundHandler::Http(_))
+        matches!(
+            self,
+            OutboundHandler::Socks5 { .. } | OutboundHandler::Http(_)
+        )
     }
 
     /// Check if this handler allows UDP
