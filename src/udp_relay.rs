@@ -6,6 +6,7 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::UdpSocket;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::core::hooks::{Address, OutboundType, UserId};
@@ -196,6 +197,7 @@ pub(crate) async fn handle_udp_over_tcp<T: AsyncRead + AsyncWrite + Unpin + Send
     mut stream: Stream,
     initial_data: Vec<u8>,
     user_id: UserId,
+    cancel: CancellationToken,
 ) -> Result<()> {
     let stream_id = stream.id();
 
@@ -329,10 +331,38 @@ pub(crate) async fn handle_udp_over_tcp<T: AsyncRead + AsyncWrite + Unpin + Send
         Ok::<(), Error>(())
     };
 
-    // Run both directions; stop when either finishes (EOF or error).
+    // Idle watchdog: terminate if no data moves for relay_idle_timeout.
+    let idle_timeout = server.config.relay_idle_timeout;
+    let up_watch = upload_bytes.clone();
+    let down_watch = download_bytes.clone();
+    let idle_watchdog = async {
+        let check_interval = std::cmp::max(idle_timeout / 10, std::time::Duration::from_secs(1));
+        let mut prev_up = up_watch.load(Ordering::Relaxed);
+        let mut prev_down = down_watch.load(Ordering::Relaxed);
+        let mut idle_since = tokio::time::Instant::now();
+
+        loop {
+            tokio::time::sleep(check_interval).await;
+            let cur_up = up_watch.load(Ordering::Relaxed);
+            let cur_down = down_watch.load(Ordering::Relaxed);
+            if cur_up != prev_up || cur_down != prev_down {
+                prev_up = cur_up;
+                prev_down = cur_down;
+                idle_since = tokio::time::Instant::now();
+            } else if idle_since.elapsed() >= idle_timeout {
+                debug!(stream_id, "UDP relay idle for {:?}, terminating", idle_timeout);
+                cancel.cancel();
+                return;
+            }
+        }
+    };
+
+    // Run both directions; stop when either finishes (EOF, error, idle, or cancel).
     let relay_result = tokio::select! {
         r = client_to_udp => r,
         r = udp_to_client => r,
+        _ = idle_watchdog => Ok(()),
+        _ = cancel.cancelled() => Ok(()),
     };
 
     match relay_result {
@@ -468,5 +498,203 @@ mod tests {
         assert_eq!(&buf[..n], b"hello");
         let n = reader.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b" world");
+    }
+
+    use crate::core::hooks::{DirectRouter, SinglePasswordAuth};
+    use crate::core::padding::{DEFAULT_SCHEME, PaddingFactory};
+    use crate::core::server::Server;
+    use crate::core::session::{Session, SessionConfig};
+    use crate::core::stream::{Stream, WriteCommand};
+
+    /// RED: UDP relay should terminate when idle (no data flows) for
+    /// relay_idle_timeout. Currently handle_udp_over_tcp has no idle
+    /// watchdog, so zombie UDP sessions persist indefinitely when the
+    /// remote UDP endpoint goes silent.
+    #[tokio::test]
+    async fn test_udp_relay_terminates_when_idle() {
+        // Bind a local UDP socket to act as the "remote" endpoint.
+        let remote_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = remote_udp.local_addr().unwrap();
+
+        let server = Arc::new(
+            Server::builder()
+                .authenticator(Arc::new(SinglePasswordAuth::new("test")))
+                .router(Arc::new(DirectRouter))
+                .relay_idle_timeout(std::time::Duration::from_millis(500))
+                .build()
+                .unwrap(),
+        );
+
+        let (_client_io, server_io) = tokio::io::duplex(65536);
+        let padding = PaddingFactory::new(DEFAULT_SCHEME).unwrap();
+        let session = Arc::new(Session::new_server(
+            server_io,
+            padding,
+            SessionConfig::default(),
+        ));
+
+        let (write_cmd_tx, mut write_cmd_rx) =
+            tokio::sync::mpsc::channel::<WriteCommand>(256);
+        tokio::spawn(async move {
+            while write_cmd_rx.recv().await.is_some() {}
+        });
+        let (data_tx, stream) = Stream::new(1, write_cmd_tx, 128);
+
+        // Build UoT connect request: is_connect=true, IPv4 pointing to our UDP socket.
+        let ip = match remote_addr {
+            SocketAddr::V4(v4) => v4.ip().octets(),
+            _ => panic!("expected v4"),
+        };
+        let port = remote_addr.port();
+        let mut uot_request = vec![0x01]; // is_connect = true
+        uot_request.push(0x01); // SOCKS5 IPv4
+        uot_request.extend_from_slice(&ip);
+        uot_request.extend_from_slice(&port.to_be_bytes());
+
+        // Send the UoT request + one small UDP payload so the relay starts.
+        let payload_len: u16 = 5;
+        uot_request.extend_from_slice(&payload_len.to_be_bytes());
+        uot_request.extend_from_slice(b"hello");
+        data_tx
+            .send(bytes::Bytes::from(uot_request))
+            .await
+            .unwrap();
+
+        // Don't send any more data — the relay should go idle.
+        // Don't drop data_tx either — that would cause EOF, not idle timeout.
+
+        // The relay should terminate within relay_idle_timeout (500ms) + margin.
+        // RED: Currently handle_udp_over_tcp has no idle watchdog, so this
+        // will hang until the 3-second timeout expires.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            handle_udp_over_tcp(
+                server,
+                session,
+                stream,
+                Vec::new(),
+                42,
+                CancellationToken::new(),
+            ),
+        )
+        .await;
+
+        // Must complete (not timeout). If it timed out, the idle watchdog is missing.
+        assert!(
+            result.is_ok(),
+            "UDP relay should have terminated after 500ms idle timeout, \
+             but it hung — no idle watchdog implemented"
+        );
+    }
+
+    /// RED: UDP relay should stop when a cancellation token is fired
+    /// (e.g. when the connection manager shuts down the session).
+    /// Currently handle_udp_over_tcp does not accept or check a
+    /// CancellationToken, so external cancellation has no effect.
+    #[tokio::test]
+    async fn test_udp_relay_responds_to_cancellation() {
+        let remote_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = remote_udp.local_addr().unwrap();
+
+        let server = Arc::new(
+            Server::builder()
+                .authenticator(Arc::new(SinglePasswordAuth::new("test")))
+                .router(Arc::new(DirectRouter))
+                .build()
+                .unwrap(),
+        );
+
+        let (_client_io, server_io) = tokio::io::duplex(65536);
+        let padding = PaddingFactory::new(DEFAULT_SCHEME).unwrap();
+        let session = Arc::new(Session::new_server(
+            server_io,
+            padding,
+            SessionConfig::default(),
+        ));
+
+        let (write_cmd_tx, mut write_cmd_rx) =
+            tokio::sync::mpsc::channel::<WriteCommand>(256);
+        tokio::spawn(async move {
+            while write_cmd_rx.recv().await.is_some() {}
+        });
+        let (data_tx, stream) = Stream::new(1, write_cmd_tx, 128);
+
+        // UoT connect request
+        let ip = match remote_addr {
+            SocketAddr::V4(v4) => v4.ip().octets(),
+            _ => panic!("expected v4"),
+        };
+        let port = remote_addr.port();
+        let mut uot_request = vec![0x01, 0x01];
+        uot_request.extend_from_slice(&ip);
+        uot_request.extend_from_slice(&port.to_be_bytes());
+        let payload_len: u16 = 5;
+        uot_request.extend_from_slice(&payload_len.to_be_bytes());
+        uot_request.extend_from_slice(b"hello");
+        data_tx
+            .send(bytes::Bytes::from(uot_request))
+            .await
+            .unwrap();
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_clone = cancel.clone();
+
+        // Cancel after 200ms
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            cancel_clone.cancel();
+        });
+
+        // Keep the remote echoing so the relay stays "active" —
+        // only the cancel token should stop it.
+        let echo_udp = remote_udp;
+        tokio::spawn(async move {
+            let mut buf = [0u8; 65536];
+            loop {
+                match echo_udp.recv_from(&mut buf).await {
+                    Ok((n, src)) => {
+                        let _ = echo_udp.send_to(&buf[..n], src).await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Keep client sending data so the relay doesn't EOF.
+        let data_tx_clone = data_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                let mut pkt = Vec::new();
+                pkt.extend_from_slice(&4u16.to_be_bytes());
+                pkt.extend_from_slice(b"ping");
+                if data_tx_clone
+                    .send(bytes::Bytes::from(pkt))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handle_udp_over_tcp(
+                server,
+                session,
+                stream,
+                Vec::new(),
+                42,
+                cancel,
+            ),
+        )
+        .await;
+
+        // With a cancel token, it should stop within 200ms + margin.
+        assert!(
+            result.is_ok(),
+            "UDP relay should have stopped when cancel token fired"
+        );
     }
 }
