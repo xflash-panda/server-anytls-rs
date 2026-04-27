@@ -136,8 +136,10 @@ pub(crate) async fn handle_stream<T: AsyncRead + AsyncWrite + Unpin + Send + 'st
 
     if is_udp_over_tcp(&target) {
         let trailing = buf[consumed..n].to_vec();
-        return crate::udp_relay::handle_udp_over_tcp(server, session, stream, trailing, user_id)
-            .await;
+        return crate::udp_relay::handle_udp_over_tcp(
+            server, session, stream, trailing, user_id, cancel,
+        )
+        .await;
     }
 
     let trailing = buf[consumed..n].to_vec();
