@@ -350,7 +350,10 @@ pub(crate) async fn handle_udp_over_tcp<T: AsyncRead + AsyncWrite + Unpin + Send
                 prev_down = cur_down;
                 idle_since = tokio::time::Instant::now();
             } else if idle_since.elapsed() >= idle_timeout {
-                debug!(stream_id, "UDP relay idle for {:?}, terminating", idle_timeout);
+                debug!(
+                    stream_id,
+                    "UDP relay idle for {:?}, terminating", idle_timeout
+                );
                 cancel.cancel();
                 return;
             }
@@ -524,11 +527,8 @@ mod tests {
             SessionConfig::default(),
         ));
 
-        let (write_cmd_tx, mut write_cmd_rx) =
-            tokio::sync::mpsc::channel::<WriteCommand>(256);
-        tokio::spawn(async move {
-            while write_cmd_rx.recv().await.is_some() {}
-        });
+        let (write_cmd_tx, mut write_cmd_rx) = tokio::sync::mpsc::channel::<WriteCommand>(256);
+        tokio::spawn(async move { while write_cmd_rx.recv().await.is_some() {} });
         let (data_tx, stream) = Stream::new(1, write_cmd_tx, 128);
 
         // Build UoT connect request: is_connect=true, IPv4 pointing to our UDP socket.
@@ -546,10 +546,7 @@ mod tests {
         let payload_len: u16 = 5;
         uot_request.extend_from_slice(&payload_len.to_be_bytes());
         uot_request.extend_from_slice(b"hello");
-        data_tx
-            .send(bytes::Bytes::from(uot_request))
-            .await
-            .unwrap();
+        data_tx.send(bytes::Bytes::from(uot_request)).await.unwrap();
 
         // Don't send any more data — the relay should go idle.
         // Don't drop data_tx either — that would cause EOF, not idle timeout.
@@ -603,11 +600,8 @@ mod tests {
             SessionConfig::default(),
         ));
 
-        let (write_cmd_tx, mut write_cmd_rx) =
-            tokio::sync::mpsc::channel::<WriteCommand>(256);
-        tokio::spawn(async move {
-            while write_cmd_rx.recv().await.is_some() {}
-        });
+        let (write_cmd_tx, mut write_cmd_rx) = tokio::sync::mpsc::channel::<WriteCommand>(256);
+        tokio::spawn(async move { while write_cmd_rx.recv().await.is_some() {} });
         let (data_tx, stream) = Stream::new(1, write_cmd_tx, 128);
 
         // UoT connect request
@@ -622,10 +616,7 @@ mod tests {
         let payload_len: u16 = 5;
         uot_request.extend_from_slice(&payload_len.to_be_bytes());
         uot_request.extend_from_slice(b"hello");
-        data_tx
-            .send(bytes::Bytes::from(uot_request))
-            .await
-            .unwrap();
+        data_tx.send(bytes::Bytes::from(uot_request)).await.unwrap();
 
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_clone = cancel.clone();
@@ -658,11 +649,7 @@ mod tests {
                 let mut pkt = Vec::new();
                 pkt.extend_from_slice(&4u16.to_be_bytes());
                 pkt.extend_from_slice(b"ping");
-                if data_tx_clone
-                    .send(bytes::Bytes::from(pkt))
-                    .await
-                    .is_err()
-                {
+                if data_tx_clone.send(bytes::Bytes::from(pkt)).await.is_err() {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -671,14 +658,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            handle_udp_over_tcp(
-                server,
-                session,
-                stream,
-                Vec::new(),
-                42,
-                cancel,
-            ),
+            handle_udp_over_tcp(server, session, stream, Vec::new(), 42, cancel),
         )
         .await;
 
