@@ -323,6 +323,7 @@ where
     tokio::select! {
         _ = relay => {}
         _ = idle_watchdog => {}
+        _ = cancel.cancelled() => {}
     }
 
     let up = upload_bytes.load(Ordering::Relaxed) + trailing_len;
@@ -623,6 +624,99 @@ mod tests {
         assert!(up > 0, "expected upload bytes to be recorded, got 0");
         assert!(down > 0, "expected download bytes to be recorded, got 0");
         assert_eq!(recording.request_count.load(Ordering::Relaxed), 1);
+    }
+
+    /// TCP relay must terminate promptly when cancel token fires.
+    /// Without `cancel.cancelled()` in the relay select!, zombie relays
+    /// accumulate for up to 60s (idle timeout), exhausting CPU/FDs under load.
+    #[tokio::test]
+    async fn test_tcp_relay_responds_to_cancellation() {
+        // TCP server that keeps the connection alive indefinitely (never closes).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = listener.accept().await {
+                let (mut r, mut w) = s.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            }
+        });
+
+        let server = Arc::new(
+            Server::builder()
+                .authenticator(Arc::new(SinglePasswordAuth::new("test")))
+                .router(Arc::new(DirectRouter))
+                // Long idle timeout — relay must NOT wait for this.
+                .relay_idle_timeout(std::time::Duration::from_secs(300))
+                .build()
+                .unwrap(),
+        );
+
+        let (_client_io, server_io) = tokio::io::duplex(65536);
+        let padding = PaddingFactory::new(DEFAULT_SCHEME).unwrap();
+        let session = Arc::new(Session::new_server(
+            server_io,
+            padding,
+            SessionConfig::default(),
+        ));
+
+        let (write_cmd_tx, mut write_cmd_rx) = tokio::sync::mpsc::channel::<WriteCommand>(256);
+        tokio::spawn(async move { while write_cmd_rx.recv().await.is_some() {} });
+        let (data_tx, stream) = Stream::new(1, write_cmd_tx, 128);
+
+        // SOCKS5 IPv4 address pointing to echo server
+        let ip = match echo_addr {
+            std::net::SocketAddr::V4(v4) => v4.ip().octets(),
+            _ => panic!("expected v4"),
+        };
+        let port = echo_addr.port();
+        let mut addr_data = vec![0x01];
+        addr_data.extend_from_slice(&ip);
+        addr_data.extend_from_slice(&port.to_be_bytes());
+        data_tx.send(bytes::Bytes::from(addr_data)).await.unwrap();
+
+        // Send some data so the relay starts, then keep channel open (no EOF).
+        data_tx
+            .send(bytes::Bytes::from_static(b"hello"))
+            .await
+            .unwrap();
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+
+        // Cancel after 200ms
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            cancel_clone.cancel();
+        });
+
+        // Keep client sending data so the relay stays active (not idle).
+        let data_tx_clone = data_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                if data_tx_clone
+                    .send(bytes::Bytes::from_static(b"ping"))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+
+        // The relay should stop within 200ms + margin (cancel token).
+        // Without the fix, it would hang for 300s (idle timeout).
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            handle_stream(server, session, stream, 42, cancel),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "TCP relay should have stopped when cancel token fired, \
+             but it hung — missing cancel.cancelled() in select!"
+        );
     }
 
     /// RED: RELAY_BUF_SIZE is 256KB, which causes excessive memory usage
