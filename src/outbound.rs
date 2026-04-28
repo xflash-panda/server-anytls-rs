@@ -323,6 +323,7 @@ where
     tokio::select! {
         _ = relay => {}
         _ = idle_watchdog => {}
+        _ = cancel.cancelled() => {}
     }
 
     let up = upload_bytes.load(Ordering::Relaxed) + trailing_len;
@@ -623,6 +624,99 @@ mod tests {
         assert!(up > 0, "expected upload bytes to be recorded, got 0");
         assert!(down > 0, "expected download bytes to be recorded, got 0");
         assert_eq!(recording.request_count.load(Ordering::Relaxed), 1);
+    }
+
+    /// Verify that the TCP relay responds to the cancellation token.
+    /// Without the `cancel.cancelled()` branch in the `select!`, the relay
+    /// would only stop when the peer closes (EOF) or the idle watchdog fires,
+    /// leading to zombie connections that pin CPU to 100 %.
+    #[tokio::test]
+    async fn test_tcp_relay_responds_to_cancellation() {
+        // Echo server that keeps connections alive indefinitely
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+
+        let recording = Arc::new(RecordingStats::new());
+        let server = Arc::new(
+            Server::builder()
+                .authenticator(Arc::new(SinglePasswordAuth::new("test")))
+                .stats(recording.clone() as Arc<dyn StatsCollector>)
+                .router(Arc::new(DirectRouter))
+                .relay_idle_timeout(Duration::from_secs(300)) // very long — must NOT be the exit path
+                .build()
+                .unwrap(),
+        );
+
+        let (_client_io, server_io) = tokio::io::duplex(65536);
+        let padding = PaddingFactory::new(DEFAULT_SCHEME).unwrap();
+        let session = Arc::new(Session::new_server(
+            server_io,
+            padding,
+            SessionConfig::default(),
+        ));
+
+        let (write_cmd_tx, mut write_cmd_rx) = tokio::sync::mpsc::channel::<WriteCommand>(256);
+        tokio::spawn(async move { while write_cmd_rx.recv().await.is_some() {} });
+        let (data_tx, stream) = Stream::new(1, write_cmd_tx, 128);
+
+        // SOCKS5 IPv4 address pointing to our echo server
+        let ip = match echo_addr {
+            std::net::SocketAddr::V4(v4) => v4.ip().octets(),
+            _ => panic!("expected v4"),
+        };
+        let port = echo_addr.port();
+        let mut addr_data = vec![0x01];
+        addr_data.extend_from_slice(&ip);
+        addr_data.extend_from_slice(&port.to_be_bytes());
+        data_tx.send(bytes::Bytes::from(addr_data)).await.unwrap();
+
+        // Keep pumping data so neither EOF nor idle timeout fires
+        let pump_tx = data_tx.clone();
+        let pump = tokio::spawn(async move {
+            loop {
+                if pump_tx
+                    .send(bytes::Bytes::from_static(b"keepalive"))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+
+        let cancel = CancellationToken::new();
+        let cancel2 = cancel.clone();
+
+        // Fire cancel after 200 ms
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            cancel2.cancel();
+        });
+
+        // The relay MUST exit within 3 s; without the fix it would hang for 300 s
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            handle_stream(server, session, stream, 99, cancel),
+        )
+        .await;
+
+        pump.abort();
+        drop(data_tx);
+
+        assert!(
+            result.is_ok(),
+            "relay did not respond to cancellation token within 3 s — \
+             missing cancel.cancelled() branch in tokio::select!"
+        );
     }
 
     /// RED: RELAY_BUF_SIZE is 256KB, which causes excessive memory usage
