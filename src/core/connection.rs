@@ -83,6 +83,10 @@ impl ConnectionManager {
 
     pub fn unregister(&self, conn_id: ConnectionId) {
         if let Some((_, conn)) = self.connections.remove(&conn_id) {
+            // Cancel the token so all relay tasks exit promptly instead of
+            // lingering as orphans until idle timeout (60s).
+            conn.cancel_token.cancel();
+
             let user_id = conn.info.user_id;
             self.user_connections
                 .remove_if_mut(&user_id, |_, conn_ids| {
@@ -378,5 +382,56 @@ mod tests {
 
         assert_eq!(manager.connection_count(), 0);
         assert_eq!(manager.user_count(), 0);
+    }
+
+    /// RED: unregister() must cancel the cancel_token so that relay tasks
+    /// associated with this connection exit promptly. Without cancellation,
+    /// relay tasks become orphans — they linger until idle timeout (60s) or
+    /// until the remote closes, accumulating CPU/memory/FDs under churn.
+    ///
+    /// Scenario: recv_loop exits (TLS EOF) → handle_connection returns →
+    /// scopeguard calls unregister() → semaphore permit released → new
+    /// connections accepted. But old relay tasks still run because their
+    /// cancel_token was never cancelled. Under sustained reconnect load,
+    /// orphan tasks accumulate → CPU 100%, TCP ping unresponsive.
+    #[test]
+    fn test_unregister_cancels_token() {
+        let manager = ConnectionManager::new();
+        let (conn_id, token) = manager.register(1, "127.0.0.1:1234".parse().unwrap());
+
+        assert!(
+            !token.is_cancelled(),
+            "token should not be cancelled before unregister"
+        );
+
+        manager.unregister(conn_id);
+
+        assert!(
+            token.is_cancelled(),
+            "unregister() must cancel the cancel_token so relay tasks \
+             exit promptly instead of lingering as zombies until idle \
+             timeout. Without this, orphan relay tasks accumulate under \
+             connection churn → CPU 100%."
+        );
+    }
+
+    /// Multiple connections for same user: unregister one must only cancel
+    /// that connection's token, not affect the other.
+    #[test]
+    fn test_unregister_cancels_only_own_token() {
+        let manager = ConnectionManager::new();
+        let (id1, token1) = manager.register(1, "127.0.0.1:1234".parse().unwrap());
+        let (_, token2) = manager.register(1, "127.0.0.1:1235".parse().unwrap());
+
+        manager.unregister(id1);
+
+        assert!(
+            token1.is_cancelled(),
+            "unregistered connection's token must be cancelled"
+        );
+        assert!(
+            !token2.is_cancelled(),
+            "other connection's token must NOT be cancelled"
+        );
     }
 }

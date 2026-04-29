@@ -326,6 +326,11 @@ where
         _ = cancel.cancelled() => {}
     }
 
+    // Drop the remote TCP socket immediately to free the FD.
+    // Without this, the socket lingers until after send_fin(),
+    // which may block on channel backpressure.
+    drop(counted_remote);
+
     let up = upload_bytes.load(Ordering::Relaxed) + trailing_len;
     let down = download_bytes.load(Ordering::Relaxed);
     if up > 0 || down > 0 {
