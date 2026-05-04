@@ -1,10 +1,19 @@
 version: 2
+registries:
+  xflash-panda-git:
+    type: git
+    url: https://github.com
+    username: x-access-token
+    password: ${{ secrets.XFLASH_PANDA_REPO_TOKEN }}
+
 updates:
   - package-ecosystem: cargo
     directory: /
+    registries:
+      - xflash-panda-git
     schedule:
       interval: weekly
-    target-branch: dev
+    target-branch: dev/master
     open-pull-requests-limit: 5
     labels:
       - dependencies
@@ -15,7 +24,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    target-branch: dev
+    target-branch: dev/master
     open-pull-requests-limit: 5
     labels:
       - ci
