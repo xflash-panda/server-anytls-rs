@@ -166,13 +166,23 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
         let writer = self.write_half.clone();
         let writer_failed = CancellationToken::new();
         let writer_failed_signal = writer_failed.clone();
+        // Clone for the writer task so it can observe cancellation. Without
+        // this, a write_all blocked on a slow/dead peer keeps the writer task
+        // alive indefinitely, holding the only remaining write_half Arc clone
+        // → underlying TcpStream stuck in CLOSE-WAIT for tcp_retries2 (~15min).
+        let writer_cancel = cancel_token.clone();
         tokio::spawn(async move {
             // Reusable buffer for coalescing header+payload into single writes.
             let mut combined_buf = Vec::with_capacity(HEADER_SIZE + u16::MAX as usize);
 
             let err = 'outer: loop {
-                let Some(cmd) = write_cmd_rx.recv().await else {
-                    break None;
+                let cmd = tokio::select! {
+                    biased;
+                    _ = writer_cancel.cancelled() => break None,
+                    r = write_cmd_rx.recv() => match r {
+                        Some(c) => c,
+                        None => break None,
+                    },
                 };
 
                 // Write the first command under a lock hold.
@@ -180,7 +190,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                 // cause legitimate delays exceeding 5s. Aligns with
                 // sing-anytls where writeDataFrame has no deadline.
                 let mut w = writer.lock().await;
-                if let Err(e) = write_cmd_frame(&mut *w, &cmd, &mut combined_buf).await {
+                let res = tokio::select! {
+                    biased;
+                    _ = writer_cancel.cancelled() => break 'outer None,
+                    r = write_cmd_frame(&mut *w, &cmd, &mut combined_buf) => r,
+                };
+                if let Err(e) = res {
                     break Some(e);
                 }
 
@@ -200,7 +215,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                     // Yield lock so control frame writers get a turn.
                     drop(w);
                     w = writer.lock().await;
-                    if let Err(e) = write_cmd_frame(&mut *w, &cmd, &mut combined_buf).await {
+                    let res = tokio::select! {
+                        biased;
+                        _ = writer_cancel.cancelled() => break 'outer None,
+                        r = write_cmd_frame(&mut *w, &cmd, &mut combined_buf) => r,
+                    };
+                    if let Err(e) = res {
                         break 'outer Some(e);
                     }
                     batch_remaining -= 1;
@@ -209,7 +229,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Session<T> {
                 // Flush remaining data in the BufWriter to TLS.
                 // (A control frame writer may have already flushed part of
                 // the batch between lock yields — that's fine.)
-                if let Err(e) = w.flush().await {
+                let res = tokio::select! {
+                    biased;
+                    _ = writer_cancel.cancelled() => break 'outer None,
+                    r = w.flush() => r,
+                };
+                if let Err(e) = res {
                     break Some(e);
                 }
             };
@@ -2192,6 +2217,173 @@ mod tests {
             result.is_ok(),
             "write_frame should return WriteTimeout within {WRITE_TIMEOUT:?}, \
              not block indefinitely on lock acquisition"
+        );
+    }
+
+    /// RED: when the writer task is blocked inside `write_all` on a slow/dead
+    /// peer (poll_write returning Pending forever), firing `cancel_token`
+    /// must cause the writer task to exit and release its `write_half` Arc
+    /// clone. Otherwise the underlying TcpStream is held alive — producing
+    /// the CLOSE-WAIT leak observed in production (v0.1.36).
+    ///
+    /// This test wires a custom IO whose `poll_write` returns Pending
+    /// forever and tracks Drop. We drive Settings + Syn so recv_loop creates
+    /// a Stream, then write data on the Stream — the writer task picks up
+    /// the WriteCommand and gets stuck inside write_all. Then we cancel and
+    /// drop everything; the underlying IO must be dropped.
+    #[tokio::test]
+    async fn test_writer_task_releases_write_half_on_cancel_when_blocked() {
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicBool, Ordering as AOrdering};
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+        use tokio::sync::Notify;
+
+        struct StuckIo {
+            read_data: Vec<u8>,
+            read_pos: usize,
+            dropped: Arc<AtomicBool>,
+            write_observed: Arc<Notify>,
+        }
+
+        impl Drop for StuckIo {
+            fn drop(&mut self) {
+                self.dropped.store(true, AOrdering::SeqCst);
+            }
+        }
+
+        impl AsyncRead for StuckIo {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                let remaining = self.read_data.len() - self.read_pos;
+                if remaining == 0 {
+                    return Poll::Pending;
+                }
+                let n = remaining.min(buf.remaining());
+                let start = self.read_pos;
+                buf.put_slice(&self.read_data[start..start + n]);
+                self.read_pos += n;
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        impl AsyncWrite for StuckIo {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                // Signal that the writer task has reached us — lets the test
+                // proceed deterministically without timing-based sleeps.
+                self.write_observed.notify_one();
+                Poll::Pending
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Pending
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let write_observed = Arc::new(Notify::new());
+
+        // Pre-load the read buffer with Settings (matching padding, v=1 to
+        // skip write_settings_response) and a Syn so recv_loop emits a Stream.
+        let padding = test_padding();
+        let mut read_data = Vec::new();
+        let settings_text = format!("v=1\npadding-md5={}", padding.md5_hex());
+        let settings_hdr = FrameHeader {
+            command: Command::Settings,
+            stream_id: 0,
+            length: settings_text.len() as u16,
+        };
+        let mut hdr = [0u8; HEADER_SIZE];
+        settings_hdr.encode(&mut hdr);
+        read_data.extend_from_slice(&hdr);
+        read_data.extend_from_slice(settings_text.as_bytes());
+
+        let syn_hdr = FrameHeader {
+            command: Command::Syn,
+            stream_id: 1,
+            length: 0,
+        };
+        let mut hdr = [0u8; HEADER_SIZE];
+        syn_hdr.encode(&mut hdr);
+        read_data.extend_from_slice(&hdr);
+
+        let io = StuckIo {
+            read_data,
+            read_pos: 0,
+            dropped: dropped.clone(),
+            write_observed: write_observed.clone(),
+        };
+
+        let session = Arc::new(Session::new_server(io, padding, SessionConfig::default()));
+
+        let cancel = CancellationToken::new();
+        let (new_stream_tx, mut new_stream_rx) = tokio::sync::mpsc::channel(8);
+
+        let sess = session.clone();
+        let cancel_clone = cancel.clone();
+        let recv_handle =
+            tokio::spawn(async move { sess.recv_loop(new_stream_tx, cancel_clone).await });
+
+        // Pull the Stream produced by the Syn frame.
+        let mut stream =
+            tokio::time::timeout(std::time::Duration::from_secs(2), new_stream_rx.recv())
+                .await
+                .expect("timed out waiting for Stream from Syn")
+                .expect("new_stream channel closed before Stream arrived");
+
+        // Write data on the Stream. This pushes a WriteCommand into the
+        // writer task's channel; the writer task picks it up and calls
+        // write_all on StuckIo, which blocks on Pending forever.
+        stream.write_all(b"data").await.unwrap();
+
+        // Wait deterministically until the writer task has actually entered
+        // the blocked write_all (StuckIo::poll_write was called).
+        tokio::time::timeout(std::time::Duration::from_secs(2), write_observed.notified())
+            .await
+            .expect("writer task never reached poll_write — test setup is wrong");
+
+        // Now fire the cancellation. The writer task must observe this and
+        // release its write_half Arc clone, even though it is currently
+        // blocked inside write_all.
+        cancel.cancel();
+
+        // Drop everything we hold so that the only remaining strong ref to
+        // write_half (after the fix) is the writer task's clone.
+        drop(stream);
+        drop(new_stream_rx);
+        drop(session);
+
+        // recv_loop should exit promptly via its cancel branch.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), recv_handle).await;
+
+        // Poll for the underlying IO to be dropped (writer task exits, drops
+        // its write_half Arc clone, refcount → 0, BufWriter→WriteHalf→T drop).
+        let drop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !dropped.load(AOrdering::SeqCst) && std::time::Instant::now() < drop_deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            dropped.load(AOrdering::SeqCst),
+            "underlying IO was not dropped after cancel — writer task is \
+             stuck inside write_all and still holds a write_half Arc clone. \
+             In production this keeps the inbound TcpStream alive in \
+             CLOSE-WAIT until tcp_retries2 (~15min) or forever."
         );
     }
 }
