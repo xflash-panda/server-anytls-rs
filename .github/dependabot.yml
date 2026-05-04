@@ -3,7 +3,7 @@ registries:
   xflash-panda-git:
     type: git
     url: https://github.com
-    username: x-access-token
+    username: huzibaca
     password: ${{ secrets.XFLASH_PANDA_REPO_TOKEN }}
 
 updates:
