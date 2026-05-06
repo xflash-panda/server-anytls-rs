@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::business::IpVersion;
+use crate::config_auto::MaxConnections;
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
     if let Ok(d) = humantime::parse_duration(s) {
@@ -115,14 +116,15 @@ pub struct CliArgs {
     pub panel_ip_version: IpVersion,
 
     // --- Performance tuning ---
-    /// Maximum number of concurrent connections.
+    /// Maximum number of concurrent connections. Use 'auto' to derive a
+    /// sensible cap from CPU cores, total RAM, and the file-descriptor limit.
     #[arg(
         long,
         env = "X_PANDA_ANYTLS_MAX_CONNECTIONS",
-        default_value_t = 10000,
+        default_value = "auto",
         help_heading = "Performance"
     )]
-    pub max_connections: usize,
+    pub max_connections: MaxConnections,
 
     /// BufWriter buffer size for the TLS write half (bytes).
     #[arg(long, env = "X_PANDA_ANYTLS_WRITE_BUF_SIZE", default_value_t = 32 * 1024, help_heading = "Performance")]
@@ -219,7 +221,7 @@ mod tests {
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             acl_conf_file: None,
             block_private_ip: true,
-            max_connections: 10000,
+            max_connections: MaxConnections::Auto,
             refresh_geodata: false,
             panel_ip_version: IpVersion::V4,
             server_name: None,

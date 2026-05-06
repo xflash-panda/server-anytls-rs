@@ -40,6 +40,7 @@ acl-engine-rs = { git = "https://github.com/xflash-panda/acl-engine-rs.git", tag
 panel-core = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.13" }
 panel-connect-rpc = { git = "https://github.com/xflash-panda/server-panel-rs", tag = "v0.1.13" }
 socket2 = "0.6"
+libc = "0.2"
 
 [dev-dependencies]
 tokio-test = "0.4"
