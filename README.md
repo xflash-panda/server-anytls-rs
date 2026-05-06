@@ -53,7 +53,7 @@ All arguments support environment variables with `X_PANDA_ANYTLS_` prefix.
 | `--data_dir` | `/var/lib/anytls-agent-node` | Data directory |
 | `--acl_conf_file` | (none) | ACL rules YAML file |
 | `--block_private_ip` | `true` | Block private IP connections |
-| `--max_connections` | `10000` | Global connection limit |
+| `--max_connections` | `auto` | Global connection limit. `auto` derives a cap from `min(cpu_throughput, ram_budget, fd_limit)`; pass a positive integer to override. |
 | `--refresh_geodata` | `false` | Force refresh ACL geodata |
 
 ## Benchmark: Rust vs Go

@@ -1,6 +1,7 @@
 mod acl;
 mod business;
 mod config;
+mod config_auto;
 mod logger;
 mod net;
 
@@ -94,13 +95,38 @@ async fn main() -> Result<()> {
     let anytls_stats = Arc::new(AnyTlsStatsCollector(Arc::clone(&stats_collector)));
     let connection_manager = ConnectionManager::new();
 
+    let resolved_max = config_auto::resolve(cli.max_connections);
+    if let Some(bd) = resolved_max.auto {
+        log::info!(
+            value = resolved_max.value,
+            cpus = resolved_max.cpus,
+            total_mem_kb = resolved_max.total_mem_kb,
+            nofile_soft = resolved_max.nofile_soft,
+            cpu_cap = bd.cpu_cap,
+            mem_cap = bd.mem_cap,
+            fd_cap = bd.fd_cap,
+            limiting = bd.limiting.as_str(),
+            "max_connections=auto resolved"
+        );
+    } else {
+        // Same fields for Fixed too — operators reach for these numbers when
+        // an explicit value turns out wrong (e.g. OOM at 10000).
+        log::info!(
+            value = resolved_max.value,
+            cpus = resolved_max.cpus,
+            total_mem_kb = resolved_max.total_mem_kb,
+            nofile_soft = resolved_max.nofile_soft,
+            "max_connections=fixed"
+        );
+    }
+
     let mut builder = server_anytls_rs::Server::builder()
         .authenticator(authenticator)
         .stats(anytls_stats as Arc<dyn StatsCollector>)
         .router(router)
         .tls_config(tls_config)
         .connection_manager(connection_manager.clone())
-        .max_connections(cli.max_connections)
+        .max_connections(resolved_max.value)
         .write_buf_size(cli.write_buf_size)
         .stream_channel_capacity(cli.stream_channel_capacity);
 
