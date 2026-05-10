@@ -2474,4 +2474,35 @@ acl:
             "expected Reject on DNS timeout with block_private_ip=true, got {result:?}",
         );
     }
+
+    /// Host normalization (lowercase + trailing-dot strip, library default)
+    /// must cause `Example.COM`, `example.com.`, and `example.com` to share
+    /// a single cache entry — verified by the resolver call_count being 1.
+    #[tokio::test]
+    async fn test_host_normalization_shares_cache_slot() {
+        use std::sync::Arc;
+
+        let engine = AclEngine::new_default().unwrap();
+        let mock = Arc::new(dns_cache_rs::MockResolver::new());
+        mock.set(
+            "example.com",
+            Ok(vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1))]),
+        );
+        let cache = dns_cache_rs::DnsCache::builder()
+            .resolver_arc(mock.clone())
+            .query_timeout(None)
+            .build()
+            .expect("build cache");
+        let router = AclRouter::with_dns_cache(engine, false, cache);
+
+        let _ = router.resolve_domain("Example.COM").await;
+        let _ = router.resolve_domain("example.com.").await;
+        let _ = router.resolve_domain("example.com").await;
+
+        assert_eq!(
+            mock.call_count("example.com"),
+            1,
+            "normalized variants must share one cache slot",
+        );
+    }
 }
