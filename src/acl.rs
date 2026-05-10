@@ -2361,7 +2361,7 @@ acl:
         // block_private_ip=true: DNS failure would cause rejection if DNS
         // is attempted before ACL matching.
         // Simulate a server that cannot resolve Google DNS via the mock resolver.
-        let (cache, _mock) = mock_dns_cache(&["www.google.com"]);
+        let (cache, mock) = mock_dns_cache(&["www.google.com"]);
         let router = AclRouter::with_dns_cache(engine, true, cache);
 
         // Even though DNS "fails", the domain matches warp(suffix:google.com)
@@ -2372,6 +2372,15 @@ acl:
             matches!(result, OutboundType::Proxy(_)),
             "proxied domain with DNS failure should route through proxy, got {:?}",
             result
+        );
+        // Pin the "skips DNS" property: ACL match must short-circuit
+        // before resolve_domain runs. Without this assert, the test name's
+        // claim is unverified — a regression that resolves DNS first and
+        // happens to still return Proxy would silently pass.
+        assert_eq!(
+            mock.call_count("www.google.com"),
+            0,
+            "ACL match must short-circuit before DNS resolution",
         );
     }
 
@@ -2461,10 +2470,10 @@ acl:
 
         let engine = AclEngine::new_default().unwrap();
         let mock = Arc::new(dns_cache_rs::MockResolver::new());
+        // 5s delay >> 100ms timeout: the 100ms query_timeout fires first,
+        // so the resolver never returns. We exercise the Timeout branch
+        // (not NotFound) on the way to Reject.
         mock.set_delay(Some(Duration::from_secs(5)));
-        // No mapping → resolver returns NotFound; but with delay it would
-        // hit the timeout first if not for the timeout being enforced
-        // before the delay completes.
         let cache = dns_cache_rs::DnsCache::builder()
             .resolver_arc(mock)
             .query_timeout(Some(Duration::from_millis(100)))
@@ -2547,6 +2556,10 @@ acl:
         for sa in addrs.iter() {
             assert_eq!(sa.port(), 0, "resolve_domain must emit port=0");
         }
+        // Pin IP values + order so a regression in the IpAddr→SocketAddr
+        // conversion (wrong index, missed entry, etc.) fails loudly.
+        assert_eq!(addrs[0].ip(), IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+        assert_eq!(addrs[1].ip(), IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)));
     }
 
     /// Guard against silent upstream changes to dns-cache-rs defaults.
@@ -2569,6 +2582,12 @@ acl:
             dns_cache_rs::defaults::CAPACITY,
             4096,
             "capacity drifted from prior 4096 value",
+        );
+        assert_eq!(
+            dns_cache_rs::defaults::QUERY_TIMEOUT,
+            Duration::from_secs(2),
+            "query_timeout drifted from the 2s baseline relied on by the \
+             fail-closed-on-timeout test and the spec §5 behavior matrix",
         );
     }
 }
