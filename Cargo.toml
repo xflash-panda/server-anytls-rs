@@ -1,6 +1,6 @@
 [package]
 name = "server-anytls-rs"
-version = "0.1.38"
+version = "0.1.39"
 edition = "2024"
 
 [[bin]]
@@ -24,7 +24,6 @@ subtle = "2"
 tikv-jemallocator = "0.6"
 rustc-hash = "2.1.2"
 dashmap = "6.1"
-moka = { version = "0.12", features = ["future"] }
 scopeguard = "1"
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1.0"
@@ -37,6 +36,7 @@ time = { version = "0.3", features = ["formatting", "macros", "local-offset"] }
 panel-core = { git = "https://github.com/xflash-panda/server-panel-rs.git", tag = "v0.1.9" }
 panel-http = { git = "https://github.com/xflash-panda/server-panel-rs.git", tag = "v0.1.9" }
 acl-engine-rs = { git = "https://github.com/xflash-panda/acl-engine-rs.git", tag = "v0.4.4", features = ["async"] }
+dns-cache-rs = { git = "https://github.com/xflash-panda/dns-cache-rs.git", tag = "v0.2.0" }
 socket2 = "0.6"
 libc = "0.2"
 
@@ -45,6 +45,7 @@ tokio-test = "0.4"
 criterion = { version = "0.5", features = ["async_tokio"] }
 rcgen = "0.14.7"
 tempfile = "3"
+dns-cache-rs = { git = "https://github.com/xflash-panda/dns-cache-rs.git", tag = "v0.2.0", features = ["test-utils"] }
 
 [[bench]]
 name = "frame_bench"

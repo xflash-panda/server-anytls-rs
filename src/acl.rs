@@ -28,7 +28,6 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -681,33 +680,6 @@ fn is_private_ipv6(ip: &[u8; 16]) -> bool {
 // AclRouter
 // ---------------------------------------------------------------------------
 
-/// Default DNS cache TTL: 120 seconds.
-const DNS_CACHE_TTL: Duration = Duration::from_secs(120);
-
-/// Negative cache TTL: 15 seconds (short, avoids hammering DNS on failures).
-const DNS_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(15);
-
-/// Maximum number of entries in the DNS cache.
-const DNS_CACHE_MAX_ENTRIES: u64 = 4096;
-
-/// Per-entry expiry policy: negative cache entries (empty addrs) get a shorter TTL.
-struct DnsExpiry;
-
-impl moka::Expiry<String, Arc<[std::net::SocketAddr]>> for DnsExpiry {
-    fn expire_after_create(
-        &self,
-        _key: &String,
-        value: &Arc<[std::net::SocketAddr]>,
-        _current_time: std::time::Instant,
-    ) -> Option<Duration> {
-        if value.is_empty() {
-            Some(DNS_NEGATIVE_CACHE_TTL)
-        } else {
-            Some(DNS_CACHE_TTL)
-        }
-    }
-}
-
 /// ACL Router adapter implementing server_anytls_rs::OutboundRouter
 ///
 /// This adapter wraps the ACL engine and implements the OutboundRouter trait
@@ -716,17 +688,34 @@ pub struct AclRouter {
     engine: AclEngine,
     /// Block connections to private/loopback IP addresses (SSRF protection)
     block_private_ip: bool,
-    /// DNS resolution cache with built-in LRU eviction, per-entry TTL, and singleflight.
-    dns_cache: moka::future::Cache<String, Arc<[std::net::SocketAddr]>>,
+    /// DNS resolution cache (LRU eviction, per-entry TTL, singleflight,
+    /// 2s query timeout). Backed by `dns_cache_rs::DnsCache` — defaults
+    /// match the previous hand-rolled constants (TTL 120s, negative 15s,
+    /// capacity 4096).
+    dns_cache: dns_cache_rs::DnsCache,
 }
 
 impl AclRouter {
-    /// Create a new ACL router with custom private IP blocking setting
+    /// Create a new ACL router with custom private IP blocking setting.
+    ///
+    /// Uses `DnsCache::new()` defaults: 120s positive TTL, 15s negative TTL,
+    /// 4096-entry LRU cap, 2s per-query timeout, host normalization on.
     pub fn with_block_private_ip(engine: AclEngine, block_private_ip: bool) -> Self {
-        let dns_cache = moka::future::Cache::builder()
-            .max_capacity(DNS_CACHE_MAX_ENTRIES)
-            .expire_after(DnsExpiry)
-            .build();
+        Self {
+            engine,
+            block_private_ip,
+            dns_cache: dns_cache_rs::DnsCache::new(),
+        }
+    }
+
+    /// Test-only constructor — accepts a pre-built `DnsCache` so tests can
+    /// inject a `MockResolver`. Not visible in non-test builds.
+    #[cfg(test)]
+    fn with_dns_cache(
+        engine: AclEngine,
+        block_private_ip: bool,
+        dns_cache: dns_cache_rs::DnsCache,
+    ) -> Self {
         Self {
             engine,
             block_private_ip,
@@ -734,31 +723,25 @@ impl AclRouter {
         }
     }
 
-    /// Resolve a domain, using the cache if available and not expired.
-    /// Features:
-    /// - Positive cache with DNS_CACHE_TTL
-    /// - Negative cache with DNS_NEGATIVE_CACHE_TTL (avoids hammering DNS on failures)
-    /// - Singleflight: concurrent lookups for the same domain coalesce into one query (via get_with)
-    /// - Bounded capacity with LRU eviction (max DNS_CACHE_MAX_ENTRIES)
+    /// Resolve a domain via the DNS cache. Returns `None` for any failure
+    /// mode (NotFound / Timeout / Other) so the caller's existing
+    /// fail-closed branch (`block_private_ip` + unresolvable domain →
+    /// Reject) keeps working unchanged.
+    ///
+    /// The returned `SocketAddr`s carry `port == 0`; downstream
+    /// `outbound::connect_target` overrides the port via `set_port` using
+    /// the original target's port. This contract avoids storing a port
+    /// per cache entry.
     async fn resolve_domain(&self, host: &str) -> Option<Arc<[std::net::SocketAddr]>> {
-        // Fast path: cache hit avoids host.to_string() allocation.
-        if let Some(addrs) = self.dns_cache.get(host).await {
-            return if addrs.is_empty() { None } else { Some(addrs) };
+        match self.dns_cache.resolve(host).await {
+            Ok(ips) => Some(
+                ips.iter()
+                    .map(|ip| std::net::SocketAddr::new(*ip, 0))
+                    .collect::<Vec<_>>()
+                    .into(),
+            ),
+            Err(_) => None,
         }
-
-        // Cache miss: resolve and cache (get_with provides singleflight).
-        let addrs = self
-            .dns_cache
-            .get_with(host.to_string(), async {
-                tokio::net::lookup_host((host, 0u16))
-                    .await
-                    .ok()
-                    .map(|iter| iter.collect())
-                    .unwrap_or_else(|| Arc::from([]))
-            })
-            .await;
-
-        if addrs.is_empty() { None } else { Some(addrs) }
     }
 }
 
@@ -2000,29 +1983,48 @@ acl:
         );
     }
 
-    /// Inject a negative DNS cache entry (empty addrs = resolution failure)
-    /// into the router for the given domain.
-    async fn inject_dns_failure(router: &AclRouter, domain: &str) {
-        let empty_addrs: Arc<[std::net::SocketAddr]> = Arc::from([]);
-        router
-            .dns_cache
-            .insert(domain.to_string(), empty_addrs)
-            .await;
+    /// Build a `MockResolver`-backed `DnsCache` that returns
+    /// `Err(DnsError::NotFound)` for every host in `not_found_hosts`,
+    /// and `Ok` for any host pre-configured via the returned mock handle.
+    ///
+    /// `query_timeout(None)` disables the 2s default to keep tests
+    /// independent of wall-clock latency.
+    fn mock_dns_cache(
+        not_found_hosts: &[&str],
+    ) -> (
+        dns_cache_rs::DnsCache,
+        std::sync::Arc<dns_cache_rs::MockResolver>,
+    ) {
+        let mock = std::sync::Arc::new(dns_cache_rs::MockResolver::new());
+        for host in not_found_hosts {
+            mock.set(
+                host,
+                Err(dns_cache_rs::DnsError::NotFound((*host).to_string())),
+            );
+        }
+        let cache = dns_cache_rs::DnsCache::builder()
+            .resolver_arc(mock.clone())
+            .query_timeout(None)
+            .build()
+            .expect("default-ish DnsCache config must build");
+        (cache, mock)
     }
 
-    async fn make_router_with_dns_failure(block_private_ip: bool) -> AclRouter {
+    /// Build an `AclRouter` whose DNS cache returns NotFound for
+    /// `simulated-dns-fail.test` (used by the legacy fail-closed tests).
+    fn make_router_with_dns_failure(block_private_ip: bool) -> AclRouter {
         let engine = AclEngine::new_default().unwrap();
-        let router = AclRouter::with_block_private_ip(engine, block_private_ip);
-        inject_dns_failure(&router, "simulated-dns-fail.test").await;
-        router
+        let (cache, _mock) = mock_dns_cache(&["simulated-dns-fail.test"]);
+        AclRouter::with_dns_cache(engine, block_private_ip, cache)
     }
 
-    /// DNS resolution returning empty results should be treated as failure.
+    /// DNS resolution returning NotFound should be treated as failure
+    /// (the public `resolve_domain` collapses every error variant to None).
     #[tokio::test]
     async fn test_resolve_domain_empty_result_returns_none() {
-        let router = make_router_with_dns_failure(true).await;
+        let router = make_router_with_dns_failure(true);
         let result = router.resolve_domain("simulated-dns-fail.test").await;
-        assert!(result.is_none(), "empty DNS result should return None");
+        assert!(result.is_none(), "NotFound DNS result should return None");
     }
 
     /// When block_private_ip is enabled and DNS resolution fails,
@@ -2031,7 +2033,7 @@ acl:
     async fn test_acl_router_rejects_domain_on_dns_failure_when_blocking() {
         use server_anytls_rs::{Address, OutboundRouter, OutboundType};
 
-        let router = make_router_with_dns_failure(true).await;
+        let router = make_router_with_dns_failure(true);
         let addr = Address::Domain("simulated-dns-fail.test".to_string(), 80);
         let result = router.route(&addr).await;
         assert!(
@@ -2046,7 +2048,7 @@ acl:
     async fn test_acl_router_allows_domain_on_dns_failure_when_not_blocking() {
         use server_anytls_rs::{Address, OutboundRouter, OutboundType};
 
-        let router = make_router_with_dns_failure(false).await;
+        let router = make_router_with_dns_failure(false);
         let addr = Address::Domain("simulated-dns-fail.test".to_string(), 80);
         let result = router.route(&addr).await;
         assert!(
@@ -2060,94 +2062,114 @@ acl:
     // DNS cache improvement tests
     // -----------------------------------------------------------------------
 
-    /// Negative cache: cached DNS failure (empty addrs) should be stored and
-    /// cause resolve_domain to return None on subsequent lookups.
+    /// Negative cache: a cached `NotFound` should cause `resolve_domain`
+    /// to return None on subsequent lookups without re-invoking the
+    /// resolver.
     #[tokio::test]
     async fn test_negative_cache_returns_none_on_hit() {
         let engine = AclEngine::new_default().unwrap();
-        let router = AclRouter::with_block_private_ip(engine, false);
+        let (cache, mock) = mock_dns_cache(&["cached-negative.test"]);
+        let router = AclRouter::with_dns_cache(engine, false, cache);
 
-        // Insert a negative cache entry (empty addrs = DNS failure)
-        let empty_addrs: Arc<[std::net::SocketAddr]> = Arc::from([]);
-        router
-            .dns_cache
-            .insert("cached-negative.test".to_string(), empty_addrs)
-            .await;
+        // First call: miss → resolver invoked once → cached negatively.
+        let r1 = router.resolve_domain("cached-negative.test").await;
+        assert!(r1.is_none(), "first call should return None (NotFound)");
 
-        // Should return None from cache without DNS lookup
-        let result = router.resolve_domain("cached-negative.test").await;
-        assert!(result.is_none(), "negative cache hit should return None");
+        // Second call: negative cache hit → resolver NOT invoked again.
+        let r2 = router.resolve_domain("cached-negative.test").await;
+        assert!(r2.is_none(), "second call should also return None");
+
+        assert_eq!(
+            mock.call_count("cached-negative.test"),
+            1,
+            "negative cache should suppress the second resolver call",
+        );
     }
 
-    /// Singleflight: concurrent resolve_domain calls for the same host should
-    /// coalesce into a single DNS query. We verify by checking that all
-    /// concurrent callers get the same result.
+    /// Singleflight: concurrent `resolve_domain` calls for the same host
+    /// must coalesce into a single resolver invocation.
     #[tokio::test]
     async fn test_singleflight_coalesces_concurrent_lookups() {
-        let engine = AclEngine::new_default().unwrap();
-        let router = Arc::new(AclRouter::with_block_private_ip(engine, false));
+        use std::net::{IpAddr, Ipv4Addr};
+        use std::time::Duration;
 
-        // Use localhost which always resolves, so results are deterministic
+        let engine = AclEngine::new_default().unwrap();
+        let mock = std::sync::Arc::new(dns_cache_rs::MockResolver::new());
+        mock.set("same.test", Ok(vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))]));
+        // Slow the resolver so that 50 concurrent callers genuinely
+        // overlap inside the singleflight critical section.
+        mock.set_delay(Some(Duration::from_millis(50)));
+
+        let cache = dns_cache_rs::DnsCache::builder()
+            .resolver_arc(mock.clone())
+            .query_timeout(None)
+            .build()
+            .expect("build cache");
+        let router = Arc::new(AclRouter::with_dns_cache(engine, false, cache));
+
         let mut handles = Vec::new();
         for _ in 0..50 {
             let r = Arc::clone(&router);
             handles.push(tokio::spawn(
-                async move { r.resolve_domain("localhost").await },
+                async move { r.resolve_domain("same.test").await },
             ));
         }
 
-        let mut results = Vec::new();
         for h in handles {
-            results.push(h.await.unwrap());
-        }
-
-        // All results should be identical (same Arc pointer or same content)
-        let first = &results[0];
-        for (i, r) in results.iter().enumerate().skip(1) {
-            assert_eq!(
-                first.is_some(),
-                r.is_some(),
-                "result[{}] differs from result[0]",
-                i
+            let result = h.await.unwrap();
+            assert!(
+                result.is_some(),
+                "every waiter should get the cached result"
             );
         }
 
-        // Should have exactly one cache entry for "localhost"
-        assert!(
-            router
-                .dns_cache
-                .get(&"localhost".to_string())
-                .await
-                .is_some(),
-            "singleflight result should be cached"
+        assert_eq!(
+            mock.call_count("same.test"),
+            1,
+            "singleflight should issue exactly one resolver call",
         );
     }
 
     /// Cache should respect the maximum capacity and not grow unbounded.
+    /// Uses a small `capacity(2)` so we can verify the bound quickly without
+    /// inserting thousands of entries.
     #[tokio::test]
     async fn test_cache_respects_max_capacity() {
-        let engine = AclEngine::new_default().unwrap();
-        let router = AclRouter::with_block_private_ip(engine, false);
+        use std::net::{IpAddr, Ipv4Addr};
 
-        // Fill the cache beyond capacity with valid entries
-        let addr: std::net::SocketAddr = "1.2.3.4:0".parse().unwrap();
-        for i in 0..(DNS_CACHE_MAX_ENTRIES as usize + 100) {
-            router
-                .dns_cache
-                .insert(format!("domain-{}.test", i), Arc::from(vec![addr]))
-                .await;
+        let engine = AclEngine::new_default().unwrap();
+        let mock = std::sync::Arc::new(dns_cache_rs::MockResolver::new());
+        for i in 0..10u8 {
+            mock.set(
+                &format!("h{i}.test"),
+                Ok(vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, i))]),
+            );
+        }
+        let cache = dns_cache_rs::DnsCache::builder()
+            .resolver_arc(mock)
+            .capacity(2)
+            .query_timeout(None)
+            .build()
+            .expect("build cache");
+        let router = AclRouter::with_dns_cache(engine, false, cache);
+
+        for i in 0..10u8 {
+            let _ = router.resolve_domain(&format!("h{i}.test")).await;
         }
 
-        // Run pending maintenance tasks to trigger eviction
-        router.dns_cache.run_pending_tasks().await;
+        // moka eviction is eventually-consistent; nudge maintenance with
+        // a no-op invalidate so entry_count() reflects post-eviction state
+        // without a sleep.
+        router
+            .dns_cache
+            .invalidate("__sentinel_for_maintenance__")
+            .await;
 
-        // Cache should not exceed max capacity (moka may slightly overshoot temporarily)
-        let cache_len = router.dns_cache.entry_count();
+        let count = router.dns_cache.entry_count();
         assert!(
-            cache_len <= DNS_CACHE_MAX_ENTRIES + 128, // moka allows slight overshoot
-            "cache size {} should be near max {}",
-            cache_len,
-            DNS_CACHE_MAX_ENTRIES
+            count <= 8, // capacity 2 + small slack for moka small-N overshoot
+            "entry_count {} should be near capacity 2 (eviction broken?)",
+            count,
         );
     }
 
@@ -2338,10 +2360,9 @@ acl:
         let engine = AclEngine::new(config, None, false).await.unwrap();
         // block_private_ip=true: DNS failure would cause rejection if DNS
         // is attempted before ACL matching.
-        let router = AclRouter::with_block_private_ip(engine, true);
-
-        // Simulate a server that cannot resolve Google DNS.
-        inject_dns_failure(&router, "www.google.com").await;
+        // Simulate a server that cannot resolve Google DNS via the mock resolver.
+        let (cache, mock) = mock_dns_cache(&["www.google.com"]);
+        let router = AclRouter::with_dns_cache(engine, true, cache);
 
         // Even though DNS "fails", the domain matches warp(suffix:google.com)
         // so it should be routed through the proxy — NOT rejected.
@@ -2351,6 +2372,222 @@ acl:
             matches!(result, OutboundType::Proxy(_)),
             "proxied domain with DNS failure should route through proxy, got {:?}",
             result
+        );
+        // Pin the "skips DNS" property: ACL match must short-circuit
+        // before resolve_domain runs. Without this assert, the test name's
+        // claim is unverified — a regression that resolves DNS first and
+        // happens to still return Proxy would silently pass.
+        assert_eq!(
+            mock.call_count("www.google.com"),
+            0,
+            "ACL match must short-circuit before DNS resolution",
+        );
+    }
+
+    /// Transient resolver errors (`DnsError::Other`) must NOT be cached;
+    /// the next call should re-invoke the resolver. This is a behavior
+    /// improvement over the previous moka-based implementation, which
+    /// folded all errors into an empty Arc and cached them for 15 s.
+    #[tokio::test]
+    async fn test_transient_error_not_cached() {
+        use std::sync::Arc;
+
+        let engine = AclEngine::new_default().unwrap();
+        let mock = Arc::new(dns_cache_rs::MockResolver::new());
+        mock.set(
+            "broken.test",
+            Err(dns_cache_rs::DnsError::Other(Arc::new(
+                std::io::Error::other("simulated transient resolver error"),
+            ))),
+        );
+
+        let cache = dns_cache_rs::DnsCache::builder()
+            .resolver_arc(mock.clone())
+            .query_timeout(None)
+            .build()
+            .expect("build cache");
+        let router = AclRouter::with_dns_cache(engine, false, cache);
+
+        let _ = router.resolve_domain("broken.test").await;
+        let _ = router.resolve_domain("broken.test").await;
+
+        assert_eq!(
+            mock.call_count("broken.test"),
+            2,
+            "Other errors must not be cached (would be 1 if cached)",
+        );
+    }
+
+    /// A resolver that hangs longer than the configured query_timeout
+    /// must produce `None` from `resolve_domain` (the `Timeout` error
+    /// variant is collapsed to None alongside NotFound and Other).
+    /// The timeout itself is enforced by the dns-cache-rs library.
+    #[tokio::test]
+    async fn test_query_timeout_yields_none_in_router_path() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let engine = AclEngine::new_default().unwrap();
+        let mock = Arc::new(dns_cache_rs::MockResolver::new());
+        // Resolver would take 5s if it ran to completion.
+        mock.set_delay(Some(Duration::from_secs(5)));
+        // Even though we configure a hit, the delay should trip the timeout first.
+        mock.set(
+            "slow.test",
+            Ok(vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                1, 1, 1, 1,
+            ))]),
+        );
+
+        let cache = dns_cache_rs::DnsCache::builder()
+            .resolver_arc(mock)
+            .query_timeout(Some(Duration::from_millis(100)))
+            .build()
+            .expect("build cache");
+        let router = AclRouter::with_dns_cache(engine, false, cache);
+
+        let start = Instant::now();
+        let result = router.resolve_domain("slow.test").await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_none(),
+            "Timeout must collapse to None, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "should bail in ~100ms, took {elapsed:?}"
+        );
+    }
+
+    /// End-to-end fail-closed: when `block_private_ip=true`, a domain whose
+    /// resolution times out must be Rejected (same code path as NotFound).
+    #[tokio::test]
+    async fn test_acl_router_rejects_on_dns_timeout_when_blocking() {
+        use server_anytls_rs::{Address, OutboundRouter, OutboundType};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let engine = AclEngine::new_default().unwrap();
+        let mock = Arc::new(dns_cache_rs::MockResolver::new());
+        // 5s delay >> 100ms timeout: the 100ms query_timeout fires first,
+        // so the resolver never returns. We exercise the Timeout branch
+        // (not NotFound) on the way to Reject.
+        mock.set_delay(Some(Duration::from_secs(5)));
+        let cache = dns_cache_rs::DnsCache::builder()
+            .resolver_arc(mock)
+            .query_timeout(Some(Duration::from_millis(100)))
+            .build()
+            .expect("build cache");
+        let router = AclRouter::with_dns_cache(engine, true, cache);
+
+        let addr = Address::Domain("hangs.test".to_string(), 443);
+        let result = router.route(&addr).await;
+        assert!(
+            matches!(result, OutboundType::Reject),
+            "expected Reject on DNS timeout with block_private_ip=true, got {result:?}",
+        );
+    }
+
+    /// Host normalization (lowercase + trailing-dot strip, library default)
+    /// must cause `Example.COM`, `example.com.`, and `example.com` to share
+    /// a single cache entry — verified by the resolver call_count being 1.
+    #[tokio::test]
+    async fn test_host_normalization_shares_cache_slot() {
+        use std::sync::Arc;
+
+        let engine = AclEngine::new_default().unwrap();
+        let mock = Arc::new(dns_cache_rs::MockResolver::new());
+        mock.set(
+            "example.com",
+            Ok(vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                1, 1, 1, 1,
+            ))]),
+        );
+        let cache = dns_cache_rs::DnsCache::builder()
+            .resolver_arc(mock.clone())
+            .query_timeout(None)
+            .build()
+            .expect("build cache");
+        let router = AclRouter::with_dns_cache(engine, false, cache);
+
+        let _ = router.resolve_domain("Example.COM").await;
+        let _ = router.resolve_domain("example.com.").await;
+        let _ = router.resolve_domain("example.com").await;
+
+        assert_eq!(
+            mock.call_count("example.com"),
+            1,
+            "normalized variants must share one cache slot",
+        );
+    }
+
+    /// Contract test: `resolve_domain` returns `SocketAddr`s with port 0.
+    /// Downstream `outbound::connect_target` overrides the port via
+    /// `set_port(target.port())`. Pinning this contract prevents an
+    /// accidental change to a non-zero default that would silently
+    /// mis-route traffic.
+    #[tokio::test]
+    async fn test_resolve_domain_returns_socketaddr_with_zero_port() {
+        use std::net::{IpAddr, Ipv4Addr};
+        use std::sync::Arc;
+
+        let engine = AclEngine::new_default().unwrap();
+        let mock = Arc::new(dns_cache_rs::MockResolver::new());
+        mock.set(
+            "ip.test",
+            Ok(vec![
+                IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+                IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
+            ]),
+        );
+        let cache = dns_cache_rs::DnsCache::builder()
+            .resolver_arc(mock)
+            .query_timeout(None)
+            .build()
+            .expect("build cache");
+        let router = AclRouter::with_dns_cache(engine, false, cache);
+
+        let addrs = router
+            .resolve_domain("ip.test")
+            .await
+            .expect("resolver returned Ok");
+        assert_eq!(addrs.len(), 2);
+        for sa in addrs.iter() {
+            assert_eq!(sa.port(), 0, "resolve_domain must emit port=0");
+        }
+        // Pin IP values + order so a regression in the IpAddr→SocketAddr
+        // conversion (wrong index, missed entry, etc.) fails loudly.
+        assert_eq!(addrs[0].ip(), IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+        assert_eq!(addrs[1].ip(), IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)));
+    }
+
+    /// Guard against silent upstream changes to dns-cache-rs defaults.
+    /// The previous hand-rolled constants were 120s/15s/4096; the library
+    /// defaults must continue to match so production behavior stays stable.
+    #[test]
+    fn test_dns_cache_default_constants_match_previous_implementation() {
+        use std::time::Duration;
+        assert_eq!(
+            dns_cache_rs::defaults::TTL,
+            Duration::from_secs(120),
+            "positive TTL drifted from prior 120s value",
+        );
+        assert_eq!(
+            dns_cache_rs::defaults::NEGATIVE_TTL,
+            Duration::from_secs(15),
+            "negative TTL drifted from prior 15s value",
+        );
+        assert_eq!(
+            dns_cache_rs::defaults::CAPACITY,
+            4096,
+            "capacity drifted from prior 4096 value",
+        );
+        assert_eq!(
+            dns_cache_rs::defaults::QUERY_TIMEOUT,
+            Duration::from_secs(2),
+            "query_timeout drifted from the 2s baseline relied on by the \
+             fail-closed-on-timeout test and the spec §5 behavior matrix",
         );
     }
 }

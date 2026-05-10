@@ -538,6 +538,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dns-cache-rs"
+version = "0.2.0"
+source = "git+https://github.com/xflash-panda/dns-cache-rs.git?tag=v0.2.0#8e4545210ca5ac48ab659cebcf52e921e87520a3"
+dependencies = [
+ "async-trait",
+ "moka",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1946,7 +1958,7 @@ dependencies = [
 
 [[package]]
 name = "server-anytls-rs"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "acl-engine-rs",
  "anyhow",
@@ -1955,10 +1967,10 @@ dependencies = [
  "clap",
  "criterion",
  "dashmap",
+ "dns-cache-rs",
  "humantime",
  "libc",
  "md-5",
- "moka",
  "panel-core",
  "panel-http",
  "rand",
