@@ -191,10 +191,7 @@ fn bench_dns_cache_singleflight_contention(c: &mut Criterion) {
                 let total = std::time::Instant::now();
                 for _ in 0..iters {
                     let mock = Arc::new(MockResolver::new());
-                    mock.set(
-                        "same.test",
-                        Ok(vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))]),
-                    );
+                    mock.set("same.test", Ok(vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))]));
                     mock.set_delay(Some(Duration::from_millis(50)));
 
                     let cache = DnsCache::builder()

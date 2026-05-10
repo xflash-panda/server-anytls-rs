@@ -1991,7 +1991,10 @@ acl:
     /// independent of wall-clock latency.
     fn mock_dns_cache(
         not_found_hosts: &[&str],
-    ) -> (dns_cache_rs::DnsCache, std::sync::Arc<dns_cache_rs::MockResolver>) {
+    ) -> (
+        dns_cache_rs::DnsCache,
+        std::sync::Arc<dns_cache_rs::MockResolver>,
+    ) {
         let mock = std::sync::Arc::new(dns_cache_rs::MockResolver::new());
         for host in not_found_hosts {
             mock.set(
@@ -2092,10 +2095,7 @@ acl:
 
         let engine = AclEngine::new_default().unwrap();
         let mock = std::sync::Arc::new(dns_cache_rs::MockResolver::new());
-        mock.set(
-            "same.test",
-            Ok(vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))]),
-        );
+        mock.set("same.test", Ok(vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))]));
         // Slow the resolver so that 50 concurrent callers genuinely
         // overlap inside the singleflight critical section.
         mock.set_delay(Some(Duration::from_millis(50)));
@@ -2117,7 +2117,10 @@ acl:
 
         for h in handles {
             let result = h.await.unwrap();
-            assert!(result.is_some(), "every waiter should get the cached result");
+            assert!(
+                result.is_some(),
+                "every waiter should get the cached result"
+            );
         }
 
         assert_eq!(
@@ -2422,7 +2425,9 @@ acl:
         // Even though we configure a hit, the delay should trip the timeout first.
         mock.set(
             "slow.test",
-            Ok(vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1))]),
+            Ok(vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                1, 1, 1, 1,
+            ))]),
         );
 
         let cache = dns_cache_rs::DnsCache::builder()
@@ -2486,7 +2491,9 @@ acl:
         let mock = Arc::new(dns_cache_rs::MockResolver::new());
         mock.set(
             "example.com",
-            Ok(vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1))]),
+            Ok(vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                1, 1, 1, 1,
+            ))]),
         );
         let cache = dns_cache_rs::DnsCache::builder()
             .resolver_arc(mock.clone())
