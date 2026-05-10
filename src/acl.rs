@@ -2371,4 +2371,38 @@ acl:
             result
         );
     }
+
+    /// Transient resolver errors (`DnsError::Other`) must NOT be cached;
+    /// the next call should re-invoke the resolver. This is a behavior
+    /// improvement over the previous moka-based implementation, which
+    /// folded all errors into an empty Arc and cached them for 15 s.
+    #[tokio::test]
+    async fn test_transient_error_not_cached() {
+        use std::sync::Arc;
+
+        let engine = AclEngine::new_default().unwrap();
+        let mock = Arc::new(dns_cache_rs::MockResolver::new());
+        mock.set(
+            "broken.test",
+            Err(dns_cache_rs::DnsError::Other(Arc::new(
+                std::io::Error::other("simulated transient resolver error"),
+            ))),
+        );
+
+        let cache = dns_cache_rs::DnsCache::builder()
+            .resolver_arc(mock.clone())
+            .query_timeout(None)
+            .build()
+            .expect("build cache");
+        let router = AclRouter::with_dns_cache(engine, false, cache);
+
+        let _ = router.resolve_domain("broken.test").await;
+        let _ = router.resolve_domain("broken.test").await;
+
+        assert_eq!(
+            mock.call_count("broken.test"),
+            2,
+            "Other errors must not be cached (would be 1 if cached)",
+        );
+    }
 }
