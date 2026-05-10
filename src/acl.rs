@@ -2541,4 +2541,27 @@ acl:
             assert_eq!(sa.port(), 0, "resolve_domain must emit port=0");
         }
     }
+
+    /// Guard against silent upstream changes to dns-cache-rs defaults.
+    /// The previous hand-rolled constants were 120s/15s/4096; the library
+    /// defaults must continue to match so production behavior stays stable.
+    #[test]
+    fn test_dns_cache_default_constants_match_previous_implementation() {
+        use std::time::Duration;
+        assert_eq!(
+            dns_cache_rs::defaults::TTL,
+            Duration::from_secs(120),
+            "positive TTL drifted from prior 120s value",
+        );
+        assert_eq!(
+            dns_cache_rs::defaults::NEGATIVE_TTL,
+            Duration::from_secs(15),
+            "negative TTL drifted from prior 15s value",
+        );
+        assert_eq!(
+            dns_cache_rs::defaults::CAPACITY,
+            4096,
+            "capacity drifted from prior 4096 value",
+        );
+    }
 }
