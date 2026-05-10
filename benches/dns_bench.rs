@@ -120,10 +120,62 @@ fn bench_dns_single_call(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark: cost of the IpAddr→SocketAddr conversion in
+/// `AclRouter::resolve_domain` when the cache is warm.
+///
+/// This is the per-call overhead introduced by the dns-cache-rs migration:
+/// the library returns `Arc<[IpAddr]>`, but the existing
+/// `OutboundType::Direct { resolved: Arc<[SocketAddr]> }` API wants
+/// `SocketAddr`. We allocate a small `Vec<SocketAddr>` and box it into an
+/// `Arc<[SocketAddr]>` per cache hit.
+///
+/// Design budget (per spec §7): keep this under 500 ns. If exceeded, the
+/// follow-up to migrate `OutboundType::Direct` to `Arc<[IpAddr]>` becomes
+/// active work.
+fn bench_dns_cache_hit_socketaddr_conversion(c: &mut Criterion) {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+
+    let mut group = c.benchmark_group("dns_cache_hit_conversion");
+    group.sample_size(100);
+
+    // Simulate a typical 1-IP A-record resolution.
+    let ips_one: Arc<[IpAddr]> = Arc::from(vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
+    group.bench_function("one_ip", |b| {
+        b.iter(|| {
+            let _: Arc<[SocketAddr]> = ips_one
+                .iter()
+                .map(|ip| SocketAddr::new(*ip, 0))
+                .collect::<Vec<_>>()
+                .into();
+        });
+    });
+
+    // Simulate a 4-IP resolution (round-robin DNS).
+    let ips_four: Arc<[IpAddr]> = Arc::from(vec![
+        IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+        IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
+        IpAddr::V4(Ipv4Addr::new(9, 10, 11, 12)),
+        IpAddr::V4(Ipv4Addr::new(13, 14, 15, 16)),
+    ]);
+    group.bench_function("four_ips", |b| {
+        b.iter(|| {
+            let _: Arc<[SocketAddr]> = ips_four
+                .iter()
+                .map(|ip| SocketAddr::new(*ip, 0))
+                .collect::<Vec<_>>()
+                .into();
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_dns_single_call,
     bench_dns_resolution,
-    bench_dns_repeated
+    bench_dns_repeated,
+    bench_dns_cache_hit_socketaddr_conversion,
 );
 criterion_main!(benches);
