@@ -171,11 +171,63 @@ fn bench_dns_cache_hit_socketaddr_conversion(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark: 50 concurrent waiters on a single cold-miss with a 50ms
+/// resolver delay. Verifies the singleflight path coalesces work and that
+/// the dns-cache-rs library doesn't add prohibitive synchronization cost
+/// vs. the previous moka-only path.
+fn bench_dns_cache_singleflight_contention(c: &mut Criterion) {
+    use dns_cache_rs::{DnsCache, MockResolver};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("dns_singleflight");
+    group.sample_size(20);
+
+    group.bench_function("50_waiters_50ms_delay", |b| {
+        b.iter_custom(|iters| {
+            rt.block_on(async {
+                let total = std::time::Instant::now();
+                for _ in 0..iters {
+                    let mock = Arc::new(MockResolver::new());
+                    mock.set(
+                        "same.test",
+                        Ok(vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))]),
+                    );
+                    mock.set_delay(Some(Duration::from_millis(50)));
+
+                    let cache = DnsCache::builder()
+                        .resolver_arc(mock)
+                        .query_timeout(None)
+                        .build()
+                        .expect("build cache");
+
+                    let mut handles = Vec::with_capacity(50);
+                    for _ in 0..50 {
+                        let cache = cache.clone();
+                        handles.push(tokio::spawn(async move {
+                            let _ = cache.resolve("same.test").await;
+                        }));
+                    }
+                    for h in handles {
+                        h.await.unwrap();
+                    }
+                }
+                total.elapsed()
+            })
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_dns_single_call,
     bench_dns_resolution,
     bench_dns_repeated,
     bench_dns_cache_hit_socketaddr_conversion,
+    bench_dns_cache_singleflight_contention,
 );
 criterion_main!(benches);
