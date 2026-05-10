@@ -2505,4 +2505,40 @@ acl:
             "normalized variants must share one cache slot",
         );
     }
+
+    /// Contract test: `resolve_domain` returns `SocketAddr`s with port 0.
+    /// Downstream `outbound::connect_target` overrides the port via
+    /// `set_port(target.port())`. Pinning this contract prevents an
+    /// accidental change to a non-zero default that would silently
+    /// mis-route traffic.
+    #[tokio::test]
+    async fn test_resolve_domain_returns_socketaddr_with_zero_port() {
+        use std::net::{IpAddr, Ipv4Addr};
+        use std::sync::Arc;
+
+        let engine = AclEngine::new_default().unwrap();
+        let mock = Arc::new(dns_cache_rs::MockResolver::new());
+        mock.set(
+            "ip.test",
+            Ok(vec![
+                IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+                IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
+            ]),
+        );
+        let cache = dns_cache_rs::DnsCache::builder()
+            .resolver_arc(mock)
+            .query_timeout(None)
+            .build()
+            .expect("build cache");
+        let router = AclRouter::with_dns_cache(engine, false, cache);
+
+        let addrs = router
+            .resolve_domain("ip.test")
+            .await
+            .expect("resolver returned Ok");
+        assert_eq!(addrs.len(), 2);
+        for sa in addrs.iter() {
+            assert_eq!(sa.port(), 0, "resolve_domain must emit port=0");
+        }
+    }
 }
