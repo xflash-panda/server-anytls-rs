@@ -2445,4 +2445,33 @@ acl:
             "should bail in ~100ms, took {elapsed:?}"
         );
     }
+
+    /// End-to-end fail-closed: when `block_private_ip=true`, a domain whose
+    /// resolution times out must be Rejected (same code path as NotFound).
+    #[tokio::test]
+    async fn test_acl_router_rejects_on_dns_timeout_when_blocking() {
+        use server_anytls_rs::{Address, OutboundRouter, OutboundType};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let engine = AclEngine::new_default().unwrap();
+        let mock = Arc::new(dns_cache_rs::MockResolver::new());
+        mock.set_delay(Some(Duration::from_secs(5)));
+        // No mapping → resolver returns NotFound; but with delay it would
+        // hit the timeout first if not for the timeout being enforced
+        // before the delay completes.
+        let cache = dns_cache_rs::DnsCache::builder()
+            .resolver_arc(mock)
+            .query_timeout(Some(Duration::from_millis(100)))
+            .build()
+            .expect("build cache");
+        let router = AclRouter::with_dns_cache(engine, true, cache);
+
+        let addr = Address::Domain("hangs.test".to_string(), 443);
+        let result = router.route(&addr).await;
+        assert!(
+            matches!(result, OutboundType::Reject),
+            "expected Reject on DNS timeout with block_private_ip=true, got {result:?}",
+        );
+    }
 }
