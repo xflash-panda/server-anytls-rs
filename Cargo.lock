@@ -1971,7 +1971,6 @@ dependencies = [
  "humantime",
  "libc",
  "md-5",
- "moka",
  "panel-core",
  "panel-http",
  "rand",
