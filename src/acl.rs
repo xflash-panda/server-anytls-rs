@@ -2405,4 +2405,44 @@ acl:
             "Other errors must not be cached (would be 1 if cached)",
         );
     }
+
+    /// A resolver that hangs longer than the configured query_timeout
+    /// must produce `None` from `resolve_domain` (the `Timeout` error
+    /// variant is collapsed to None alongside NotFound and Other).
+    /// The timeout itself is enforced by the dns-cache-rs library.
+    #[tokio::test]
+    async fn test_query_timeout_yields_none_in_router_path() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let engine = AclEngine::new_default().unwrap();
+        let mock = Arc::new(dns_cache_rs::MockResolver::new());
+        // Resolver would take 5s if it ran to completion.
+        mock.set_delay(Some(Duration::from_secs(5)));
+        // Even though we configure a hit, the delay should trip the timeout first.
+        mock.set(
+            "slow.test",
+            Ok(vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1))]),
+        );
+
+        let cache = dns_cache_rs::DnsCache::builder()
+            .resolver_arc(mock)
+            .query_timeout(Some(Duration::from_millis(100)))
+            .build()
+            .expect("build cache");
+        let router = AclRouter::with_dns_cache(engine, false, cache);
+
+        let start = Instant::now();
+        let result = router.resolve_domain("slow.test").await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_none(),
+            "Timeout must collapse to None, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "should bail in ~100ms, took {elapsed:?}"
+        );
+    }
 }
