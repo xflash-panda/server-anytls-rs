@@ -2154,13 +2154,18 @@ acl:
             let _ = router.resolve_domain(&format!("h{i}.test")).await;
         }
 
-        // moka eviction is async; let it drain.
-        // We can't poke the inner cache, but `entry_count()` calls
-        // `run_pending_tasks()` internally for the metric we need.
+        // moka eviction is eventually-consistent; nudge maintenance with
+        // a no-op invalidate so entry_count() reflects post-eviction state
+        // without a sleep.
+        router
+            .dns_cache
+            .invalidate("__sentinel_for_maintenance__")
+            .await;
+
         let count = router.dns_cache.entry_count();
         assert!(
-            count <= 2 + 128, // moka allows transient overshoot
-            "entry_count {} should be near capacity 2",
+            count <= 8, // capacity 2 + small slack for moka small-N overshoot
+            "entry_count {} should be near capacity 2 (eviction broken?)",
             count,
         );
     }
